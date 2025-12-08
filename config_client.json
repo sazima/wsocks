@@ -1,0 +1,15 @@
+{
+  "server": {
+    "url": "wss://download.example.com/go_flare",
+    "password": "your-password-here",
+    "ping_interval": 30,
+    "ping_timeout": 10,
+    "compression": true,
+    "ws_pool_size": 8
+  },
+  "local": {
+    "host": "127.0.0.1",
+    "port": 1088
+  },
+  "log_level": "INFO"
+}
