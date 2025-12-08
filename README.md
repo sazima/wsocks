@@ -13,6 +13,8 @@
 - 使用 WebSocket 连接池, 提升并发性能
 - 通过密码和消息签名保证连接安全
 
+
+
 ## 安装
 
 ```bash
@@ -97,30 +99,10 @@ wsocks_client -c config_client.json
 | server.ws_pool_size | WebSocket 连接池大小 | 8 |
 | local.port | 本地 SOCKS5 端口 | 1080 |
 
-## 性能测试
 
-使用 `test_speed.py` 脚本对比 wsocks 和其他代理（如 v2ray）的性能：
-
-```bash
-# 安装测试依赖
-pip install requests
-
-# 运行测试（默认 wsocks:1088, v2ray:4086）
-python3 test_speed.py
-
-# 自定义端口
-python3 test_speed.py --wsocks-port 1088 --v2ray-port 4086
-
-# 只测试延迟
-python3 test_speed.py --no-download
-
-# 只测试下载速度
-python3 test_speed.py --no-latency
-```
-
-测试内容：
-- **延迟测试**：访问 Google、YouTube、GitHub 等网站，测试响应时间
-- **下载速度**：下载测试文件，测量实际传输速度
+## 对比
+同一服务器与v2ray对比
+![对比图](./speed_test/img.png)
 
 ## 常见问题
 
@@ -135,6 +117,7 @@ python3 test_speed.py --no-latency
 **连接频繁断开**
 - 调整 `ping_interval` 和 `ping_timeout`
 - 增加服务端 `timeout` 值
+- 
 
 ## 安全建议
 
