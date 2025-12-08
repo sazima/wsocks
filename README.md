@@ -10,7 +10,7 @@
 
 - **客户端**：在本地启动 SOCKS5 服务器，将流量通过 WebSocket 转发到远程服务端
 - **服务端**：接收 WebSocket 连接，代理访问目标服务器
-- 使用 WebSocket 连接池（默认 8 个连接）提升并发性能
+- 使用 WebSocket 连接池, 提升并发性能
 - 通过密码和消息签名保证连接安全
 
 ## 安装
@@ -96,6 +96,31 @@ wsocks_client -c config_client.json
 | server.password | 连接密码 | - |
 | server.ws_pool_size | WebSocket 连接池大小 | 8 |
 | local.port | 本地 SOCKS5 端口 | 1080 |
+
+## 性能测试
+
+使用 `test_speed.py` 脚本对比 wsocks 和其他代理（如 v2ray）的性能：
+
+```bash
+# 安装测试依赖
+pip install requests
+
+# 运行测试（默认 wsocks:1088, v2ray:4086）
+python3 test_speed.py
+
+# 自定义端口
+python3 test_speed.py --wsocks-port 1088 --v2ray-port 4086
+
+# 只测试延迟
+python3 test_speed.py --no-download
+
+# 只测试下载速度
+python3 test_speed.py --no-latency
+```
+
+测试内容：
+- **延迟测试**：访问 Google、YouTube、GitHub 等网站，测试响应时间
+- **下载速度**：下载测试文件，测量实际传输速度
 
 ## 常见问题
 
