@@ -3,8 +3,8 @@ import struct
 import asyncio
 import os
 from typing import Dict, Optional
-from common.logger import setup_logger
-from common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE
+from wsocks.common.logger import setup_logger
+from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE
 
 logger = setup_logger()
 

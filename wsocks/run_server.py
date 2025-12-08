@@ -2,8 +2,8 @@ import json
 import argparse
 import tornado.ioloop
 import tornado.web
-from server.ws_handler import WebSocketHandler
-from common.logger import setup_logger
+from wsocks.server.ws_handler import WebSocketHandler
+from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 

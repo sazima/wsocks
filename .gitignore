@@ -37,3 +37,4 @@ wheels/
 .DS_Store
 Thumbs.db
 .claude
+config_client1.json

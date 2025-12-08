@@ -1,9 +1,9 @@
 import asyncio
 from typing import Dict
 import tornado.websocket
-from common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
-from common.logger import setup_logger
-from server.tcp_client import TargetConnection
+from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
+from wsocks.common.logger import setup_logger
+from wsocks.server.tcp_client import TargetConnection
 
 logger = setup_logger()
 

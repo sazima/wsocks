@@ -1,7 +1,7 @@
 import asyncio
 import socket
 from typing import Optional
-from common.logger import setup_logger
+from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 

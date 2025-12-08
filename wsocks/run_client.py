@@ -1,13 +1,13 @@
 import asyncio
 import json
 import argparse
-from client.socks5_server import SOCKS5Server
-from client.ws_client import WebSocketClient
-from common.logger import setup_logger
+from wsocks.client.socks5_server import SOCKS5Server
+from wsocks.client.ws_client import WebSocketClient
+from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 
-async def main():
+async def async_main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='SOCKS5-WS Proxy Client')
     parser.add_argument('-c', '--config',
@@ -57,5 +57,9 @@ async def main():
         ws_client.connect()
     )
 
+def main():
+    """Entry point for console script"""
+    asyncio.run(async_main())
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()

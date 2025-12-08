@@ -1,8 +1,8 @@
 import asyncio
 import websockets
 from typing import List, Optional
-from common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
-from common.logger import setup_logger
+from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
+from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 
