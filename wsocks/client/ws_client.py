@@ -1,14 +1,18 @@
 import asyncio
 import websockets
+import random
+import time
+import os
 from typing import List, Optional
-from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
+from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT
 from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 
 class WebSocketClient:
     """WebSocket 客户端（支持连接池）"""
-    def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8):
+    def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8,
+                 heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50):
         self.url = url
         self.password = password
         self.socks5_server = socks5_server
@@ -19,6 +23,12 @@ class WebSocketClient:
         self.ws_pool: List[Optional[websockets.WebSocketClientProtocol]] = [None] * pool_size
         self.running = False
         self.next_ws_index = 0  # 轮询索引
+
+        # 应用层心跳配置
+        self.heartbeat_enabled = heartbeat_enabled
+        self.heartbeat_min = heartbeat_min
+        self.heartbeat_max = heartbeat_max
+        self.last_activity_time: List[float] = [0] * pool_size  # 每个连接的最后活动时间
 
     async def connect(self):
         """连接到服务器（连接池中的所有连接）"""
@@ -39,17 +49,39 @@ class WebSocketClient:
         while self.running:
             try:
                 logger.info(f"[WS-{index}] Connecting to {self.url}")
+
+                # 禁用原生 ping/pong 以避免固定时序特征
+                # 使用应用层随机心跳代替
                 ws = await websockets.connect(
                     self.url,
-                    ping_interval=self.ping_interval,
-                    ping_timeout=self.ping_timeout,
+                    ping_interval=None if self.heartbeat_enabled else self.ping_interval,
+                    ping_timeout=None if self.heartbeat_enabled else self.ping_timeout,
                     compression=self.compression
                 )
                 self.ws_pool[index] = ws
-                logger.info(f"[WS-{index}] Connected (compression={self.compression}, ping_interval={self.ping_interval}s)")
+                self.last_activity_time[index] = time.time()
 
-                # 开始接收消息
-                await self._receive_loop(index, ws)
+                heartbeat_mode = "app-layer random" if self.heartbeat_enabled else f"native {self.ping_interval}s"
+                logger.info(f"[WS-{index}] Connected (compression={self.compression}, heartbeat={heartbeat_mode})")
+
+                # 启动接收和心跳任务
+                receive_task = asyncio.ensure_future(self._receive_loop(index, ws))
+                heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(index, ws)) if self.heartbeat_enabled else None
+
+                # 等待任意任务完成（连接断开）
+                tasks = [receive_task]
+                if heartbeat_task:
+                    tasks.append(heartbeat_task)
+
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                # 取消未完成的任务
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
             except Exception as e:
                 logger.error(f"[WS-{index}] Connection error: {e}")
@@ -60,6 +92,7 @@ class WebSocketClient:
         """接收消息循环（单个连接）"""
         try:
             async for message in ws:
+                self.last_activity_time[index] = time.time()  # 更新活动时间
                 await self.handle_message(message)
         except websockets.exceptions.ConnectionClosed:
             logger.warning(f"[WS-{index}] Connection closed")
@@ -67,6 +100,45 @@ class WebSocketClient:
         except Exception as e:
             logger.error(f"[WS-{index}] Receive error: {e}")
             self.ws_pool[index] = None
+
+    async def _heartbeat_loop(self, index: int, ws: websockets.WebSocketClientProtocol):
+        """应用层心跳循环（随机间隔和数据大小）"""
+        try:
+            while self.running and self.ws_pool[index] is not None:
+                # 随机心跳间隔（模拟不规则人类行为）
+                interval = random.uniform(self.heartbeat_min, self.heartbeat_max)
+                await asyncio.sleep(interval)
+
+                # 检查连接是否仍然存活
+                if self.ws_pool[index] is None:
+                    break
+
+                # 如果最近有业务流量，跳过心跳（避免不必要的特征）
+                time_since_last_activity = time.time() - self.last_activity_time[index]
+                if time_since_last_activity < self.heartbeat_min:
+                    logger.debug(f"[WS-{index}] Skip heartbeat (recent activity: {time_since_last_activity:.1f}s ago)")
+                    continue
+
+                # 生成随机大小的心跳数据（100-2000 字节，模拟真实业务数据）
+                data_size = random.randint(100, 2000)
+                heartbeat_data = os.urandom(data_size)
+
+                # 使用一个特殊的 conn_id 发送心跳
+                heartbeat_conn_id = b'\x00\x00\x00\x00'
+                packed_data = Protocol.pack(MSG_TYPE_HEARTBEAT, heartbeat_conn_id, heartbeat_data, self.password)
+
+                try:
+                    await ws.send(packed_data)
+                    self.last_activity_time[index] = time.time()
+                    logger.debug(f"[WS-{index}] Sent heartbeat ({data_size} bytes, interval={interval:.1f}s)")
+                except Exception as e:
+                    logger.warning(f"[WS-{index}] Heartbeat send failed: {e}")
+                    break
+
+        except asyncio.CancelledError:
+            logger.debug(f"[WS-{index}] Heartbeat loop cancelled")
+        except Exception as e:
+            logger.error(f"[WS-{index}] Heartbeat loop error: {e}")
 
     async def handle_message(self, raw_data: bytes):
         """处理接收到的消息"""
@@ -108,6 +180,10 @@ class WebSocketClient:
                     # 连接可能已经被清理，这是正常情况
                     logger.debug(f"[{conn_id.hex()}] Connection already closed")
 
+            elif msg_type == MSG_TYPE_HEARTBEAT:
+                # 心跳响应，忽略即可（仅用于保持连接）
+                logger.debug(f"Received heartbeat response ({len(data)} bytes)")
+
         except Exception as e:
             logger.error(f"Handle message error: {e}")
 
@@ -130,6 +206,7 @@ class WebSocketClient:
             if ws is not None:
                 try:
                     await ws.send(packed_data)
+                    self.last_activity_time[current_index] = time.time()  # 更新活动时间
                     return
                 except Exception as e:
                     logger.warning(f"[WS-{current_index}] Send failed: {e}, trying next...")

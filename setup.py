@@ -1,11 +1,12 @@
 import setuptools
+version = '0.0.2'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()
 
 setuptools.setup(
     name='wsocks',
-    version='0.0.1',
+    version=version,
 
     # 自动查找所有包
     packages=setuptools.find_packages(),

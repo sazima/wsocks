@@ -40,7 +40,10 @@ async def async_main():
         ping_interval=config['server'].get('ping_interval', 30),
         ping_timeout=config['server'].get('ping_timeout', 10),
         compression=config['server'].get('compression', True),
-        pool_size=config['server'].get('ws_pool_size', 8)
+        pool_size=config['server'].get('ws_pool_size', 8),
+        heartbeat_enabled=config['server'].get('heartbeat_enabled', True),
+        heartbeat_min=config['server'].get('heartbeat_min', 20),
+        heartbeat_max=config['server'].get('heartbeat_max', 50)
     )
 
     # 创建 SOCKS5 服务器

@@ -56,7 +56,12 @@ wsocks_server -c config_server.json
 {
   "server": {
     "url": "ws://your-server.com:8888/ws",
-    "password": "your-password-here"
+    "password": "your-password-here",
+    "compression": true,
+    "ws_pool_size": 8,
+    "heartbeat_enabled": true,
+    "heartbeat_min": 20,
+    "heartbeat_max": 50
   },
   "local": {
     "host": "127.0.0.1",
@@ -65,6 +70,8 @@ wsocks_server -c config_server.json
   "log_level": "INFO"
 }
 ```
+
+推荐自行配置使用wss
 
 ### 4. 启动客户端
 
@@ -96,7 +103,11 @@ wsocks_client -c config_client.json
 |------|------|--------|
 | server.url | 服务端地址 | - |
 | server.password | 连接密码 | - |
+| server.compression | 启用数据压缩 | true |
 | server.ws_pool_size | WebSocket 连接池大小 | 8 |
+| server.heartbeat_enabled | 启用应用层随机心跳 | true |
+| server.heartbeat_min | 心跳最小间隔（秒） | 20 |
+| server.heartbeat_max | 心跳最大间隔（秒） | 50 |
 | local.port | 本地 SOCKS5 端口 | 1080 |
 
 

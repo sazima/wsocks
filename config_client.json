@@ -5,7 +5,10 @@
     "ping_interval": 30,
     "ping_timeout": 10,
     "compression": true,
-    "ws_pool_size": 8
+    "ws_pool_size": 8,
+    "heartbeat_enabled": true,
+    "heartbeat_min": 20,
+    "heartbeat_max": 50
   },
   "local": {
     "host": "127.0.0.1",

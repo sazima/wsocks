@@ -1,7 +1,7 @@
 import asyncio
 from typing import Dict
 import tornado.websocket
-from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED
+from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT
 from wsocks.common.logger import setup_logger
 from wsocks.server.tcp_client import TargetConnection
 
@@ -41,6 +41,11 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
             elif msg_type == MSG_TYPE_CLOSE:
                 # 关闭连接
                 asyncio.ensure_future(self.handle_close(conn_id))
+            elif msg_type == MSG_TYPE_HEARTBEAT:
+                # 心跳消息，回应确认（可选）
+                logger.debug(f"Received heartbeat ({len(data)} bytes)")
+                # 可以选择回应心跳或仅忽略
+                # asyncio.ensure_future(self.send_heartbeat_response(conn_id, data))
 
         except ValueError as e:
             logger.error(f"Invalid message: {e}")
