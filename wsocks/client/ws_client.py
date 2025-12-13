@@ -334,7 +334,12 @@ class WebSocketClient:
                     and not self.scale_down_task.done()
                     and self.scale_down_target == target
             ):
+                logger.debug(f"[Pool] Scale down task already scheduled for target={target}, skipping")
                 return
+
+            # 调试：记录为什么需要重新调度
+            if self.scale_down_task:
+                logger.debug(f"[Pool] Re-scheduling scale down: task_done={self.scale_down_task.done()}, old_target={self.scale_down_target}, new_target={target}")
 
             # 计算 delay（只算一次）
             if active_socks == 0:
@@ -351,10 +356,12 @@ class WebSocketClient:
                     f"(delay={delay:.0f}s, active_socks={active_socks})"
                 )
 
-            # 取消旧任务（如果目标不同）
-            if self.scale_down_task and not self.scale_down_task.done():
+            # 取消旧任务（仅当目标不同且还在运行时）
+            if self.scale_down_task and not self.scale_down_task.done() and self.scale_down_target != target:
+                logger.debug(f"[Pool] Cancelling old scale down task (old_target={self.scale_down_target}, new_target={target})")
                 self.scale_down_task.cancel()
 
+            # 创建新任务
             self.scale_down_target = target
             self.scale_down_task = asyncio.ensure_future(
                 self._scale_down_delayed(target, delay)
