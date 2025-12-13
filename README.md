@@ -67,6 +67,10 @@ wsocks_server -c config_server.json
     "host": "127.0.0.1",
     "port": 1080
   },
+  "udp": {
+    "enabled": false,
+    "timeout": 60
+  },
   "log_level": "INFO"
 }
 ```
@@ -81,9 +85,14 @@ wsocks_client -c config_client.json
 
 ### 5. 配置代理
 
-在浏览器或应用中设置 SOCKS5 代理：
+支持两种代理方式（同一端口自动识别）：
+
+**SOCKS5 代理**：
 - 服务器：`127.0.0.1`
 - 端口：`1080`
+
+**HTTP 代理**：
+- 服务器：`http://127.0.0.1:1080`
 
 ## 配置参数说明
 
@@ -108,7 +117,9 @@ wsocks_client -c config_client.json
 | server.heartbeat_enabled | 启用应用层随机心跳 | true |
 | server.heartbeat_min | 心跳最小间隔（秒） | 20 |
 | server.heartbeat_max | 心跳最大间隔（秒） | 50 |
-| local.port | 本地 SOCKS5 端口 | 1080 |
+| local.port | 本地代理端口（支持 SOCKS5 / HTTP） | 1080 |
+| udp.enabled | 启用 UDP 转发（SOCKS5 UDP Associate） | false |
+| udp.timeout | UDP 会话超时时间（秒） | 60 |
 
 
 ## 对比

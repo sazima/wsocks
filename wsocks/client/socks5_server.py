@@ -3,7 +3,8 @@ import struct
 import asyncio
 import os
 import time
-from typing import Dict, Optional, Tuple
+import re
+from typing import Dict, Optional, Tuple, Union
 from wsocks.common.logger import setup_logger
 from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_UDP_ASSOCIATE, MSG_TYPE_UDP_DATA
 
@@ -169,6 +170,191 @@ class SOCKS5Connection:
             pass
 
         # 等待一小段时间，让 forward_data 中的读取操作正常结束
+        await asyncio.sleep(0.05)
+
+        try:
+            self.client_socket.close()
+        except Exception as e:
+            logger.debug(f"[{self.conn_id.hex()}] Failed to close socket: {e}")
+
+
+class HTTPConnectConnection:
+    """HTTP CONNECT 连接"""
+    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client, first_byte: bytes):
+        self.client_socket = client_socket
+        self.conn_id = conn_id
+        self.ws_client = ws_client
+        self.first_byte = first_byte  # 已读取的第一个字节
+        self.running = True
+        self.connect_event = asyncio.Event()
+        self.connect_success = False
+        self.connect_error = None
+
+    async def handle(self):
+        """处理 HTTP CONNECT 连接"""
+        try:
+            # 解析 HTTP CONNECT 请求
+            target_addr, target_port = await self.parse_connect_request()
+
+            logger.info(f"[{self.conn_id.hex()}] HTTP CONNECT to {target_addr}:{target_port}")
+
+            # 发送连接请求到服务端
+            connect_data = {
+                'host': target_addr,
+                'port': target_port
+            }
+            await self.ws_client.send_message(
+                MSG_TYPE_CONNECT,
+                self.conn_id,
+                str(connect_data).encode()
+            )
+
+            # 等待服务端连接响应（最多30秒）
+            try:
+                await asyncio.wait_for(self.connect_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(f"[{self.conn_id.hex()}] Connect timeout (30s)")
+                await self.send_connect_response(success=False)
+                return
+
+            # 检查连接结果
+            if self.connect_success:
+                # 连接成功，回复 HTTP 200
+                await self.send_connect_response(success=True)
+                # 开始转发数据
+                await self.forward_data()
+            else:
+                # 连接失败，回复错误
+                error_msg = self.connect_error or "Connection failed"
+                logger.error(f"[{self.conn_id.hex()}] Connect failed: {error_msg}")
+                await self.send_connect_response(success=False)
+
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] HTTP CONNECT error: {e}")
+        finally:
+            await self.close()
+
+    async def parse_connect_request(self):
+        """解析 HTTP CONNECT 请求"""
+        # 读取完整的请求行（包括已读的第一个字节）
+        request_line = self.first_byte
+
+        # 继续读取直到 \r\n
+        while b'\r\n' not in request_line:
+            chunk = await asyncio.get_event_loop().sock_recv(self.client_socket, 1024)
+            if not chunk:
+                raise Exception("Connection closed while reading HTTP request")
+            request_line += chunk
+            if len(request_line) > 8192:  # 防止恶意请求
+                raise Exception("HTTP request line too long")
+
+        # 提取第一行
+        first_line = request_line.split(b'\r\n')[0].decode('utf-8')
+
+        # 解析 CONNECT 请求: CONNECT host:port HTTP/1.1
+        match = re.match(r'^CONNECT\s+([^:]+):(\d+)\s+HTTP/\d\.\d$', first_line, re.IGNORECASE)
+        if not match:
+            raise Exception(f"Invalid CONNECT request: {first_line}")
+
+        target_addr = match.group(1)
+        target_port = int(match.group(2))
+
+        # 读取并丢弃剩余的 HTTP 头部（直到空行）
+        while b'\r\n\r\n' not in request_line:
+            chunk = await asyncio.get_event_loop().sock_recv(self.client_socket, 1024)
+            if not chunk:
+                break
+            request_line += chunk
+            if len(request_line) > 32768:  # 防止恶意请求
+                break
+
+        return target_addr, target_port
+
+    async def send_connect_response(self, success: bool):
+        """发送 HTTP CONNECT 响应"""
+        if success:
+            response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        else:
+            response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+
+        try:
+            await asyncio.get_event_loop().sock_sendall(self.client_socket, response)
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Failed to send HTTP response: {e}")
+
+    async def forward_data(self):
+        """转发数据（与 SOCKS5 相同）"""
+        loop = asyncio.get_event_loop()
+
+        while self.running:
+            try:
+                # 从本地客户端读取数据
+                data = await loop.sock_recv(self.client_socket, 65536)
+
+                if not data:
+                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    break
+
+                # 发送到服务端
+                await self.ws_client.send_message(
+                    MSG_TYPE_DATA,
+                    self.conn_id,
+                    data
+                )
+
+            except asyncio.CancelledError:
+                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                break
+            except OSError as e:
+                if e.errno == 9:  # Bad file descriptor
+                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                else:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                break
+            except Exception as e:
+                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                break
+
+    async def send_to_client(self, data: bytes):
+        """发送数据到本地客户端"""
+        try:
+            await asyncio.get_event_loop().sock_sendall(self.client_socket, data)
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send to client error: {e}")
+            await self.close()
+
+    def on_connect_success(self):
+        """连接成功回调"""
+        logger.info(f"[{self.conn_id.hex()}] Server connected successfully")
+        self.connect_success = True
+        self.connect_event.set()
+
+    def on_connect_failed(self, reason: str):
+        """连接失败回调"""
+        logger.warning(f"[{self.conn_id.hex()}] Server connect failed: {reason}")
+        self.connect_success = False
+        self.connect_error = reason
+        self.connect_event.set()
+
+    async def close(self, notify_server: bool = True):
+        """关闭连接"""
+        if not self.running:
+            return
+
+        self.running = False
+        logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        if notify_server:
+            try:
+                await self.ws_client.send_message(MSG_TYPE_CLOSE, self.conn_id, b'')
+            except Exception as e:
+                logger.debug(f"[{self.conn_id.hex()}] Failed to send close message: {e}")
+
+        try:
+            self.client_socket.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
         await asyncio.sleep(0.05)
 
         try:
@@ -361,7 +547,7 @@ class SOCKS5Server:
         self.host = host
         self.port = port
         self.ws_client = ws_client
-        self.connections: Dict[bytes, SOCKS5Connection] = {}
+        self.connections: Dict[bytes, Union[SOCKS5Connection, HTTPConnectConnection]] = {}
         self.udp_enabled = udp_enabled
         self.udp_relay: Optional[UDPRelayServer] = None
 
@@ -402,18 +588,80 @@ class SOCKS5Server:
             # 生成连接 ID
             conn_id = os.urandom(4)
 
-            # 创建连接处理
-            connection = SOCKS5Connection(client_socket, conn_id, self.ws_client)
-            self.connections[conn_id] = connection
+            # 异步处理连接（带协议自动检测）
+            asyncio.ensure_future(self._handle_connection(client_socket, conn_id, addr))
 
-            # 异步处理连接（传入服务器实例以支持 UDP ASSOCIATE）
-            asyncio.ensure_future(self._handle_connection(connection))
-
-    async def _handle_connection(self, connection: SOCKS5Connection):
-        """处理连接"""
+    async def _handle_connection(self, client_socket: socket.socket, conn_id: bytes, addr):
+        """处理连接（带协议自动检测）"""
+        connection = None
         try:
-            # SOCKS5 握手
-            await connection.socks5_handshake()
+            # 读取第一个字节以检测协议类型
+            first_byte = await asyncio.get_event_loop().sock_recv(client_socket, 1)
+
+            if not first_byte:
+                logger.warning(f"[{conn_id.hex()}] Connection closed immediately")
+                client_socket.close()
+                return
+
+            protocol_byte = first_byte[0]
+
+            # 协议检测
+            if protocol_byte == 0x05:
+                # SOCKS5 协议
+                logger.debug(f"[{conn_id.hex()}] Detected SOCKS5 protocol")
+                connection = SOCKS5Connection(client_socket, conn_id, self.ws_client)
+                self.connections[conn_id] = connection
+
+                # 处理 SOCKS5 握手（第一个字节已经读取）
+                await self._handle_socks5_connection(connection, first_byte)
+
+            elif protocol_byte == 0x43:  # 'C' - 可能是 "CONNECT"
+                # HTTP CONNECT 协议
+                logger.debug(f"[{conn_id.hex()}] Detected HTTP CONNECT protocol")
+                connection = HTTPConnectConnection(client_socket, conn_id, self.ws_client, first_byte)
+                self.connections[conn_id] = connection
+
+                # 处理 HTTP CONNECT
+                await connection.handle()
+
+            else:
+                # 未知协议
+                logger.warning(f"[{conn_id.hex()}] Unknown protocol (first byte: {protocol_byte:#x})")
+                try:
+                    client_socket.close()
+                except:
+                    pass
+                return
+
+        except asyncio.CancelledError:
+            logger.debug(f"[{conn_id.hex()}] Task cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"[{conn_id.hex()}] Unexpected error: {e}")
+            # 确保 socket 被关闭
+            try:
+                client_socket.close()
+            except:
+                pass
+        finally:
+            # 延迟一点删除连接，给服务端发送关闭消息的时间
+            await asyncio.sleep(0.1)
+            if conn_id in self.connections:
+                del self.connections[conn_id]
+
+    async def _handle_socks5_connection(self, connection: SOCKS5Connection, first_byte: bytes):
+        """处理 SOCKS5 连接"""
+        try:
+            # 继续 SOCKS5 握手（第一个字节已经读取是 0x05）
+            data = first_byte + await asyncio.get_event_loop().sock_recv(connection.client_socket, 1)
+            version, nmethods = struct.unpack('!BB', data)
+
+            # 读取认证方法
+            methods = await asyncio.get_event_loop().sock_recv(connection.client_socket, nmethods)
+
+            # 回复：无需认证
+            response = struct.pack('!BB', 5, 0)
+            await asyncio.get_event_loop().sock_sendall(connection.client_socket, response)
 
             # 解析请求
             cmd, target_addr, target_port = await connection.socks5_connect_request_parse()
@@ -421,7 +669,7 @@ class SOCKS5Server:
             if cmd == 3:  # UDP ASSOCIATE
                 await self._handle_udp_associate(connection, target_addr, target_port)
             else:  # CONNECT
-                # 恢复原有的连接处理流程
+                # TCP CONNECT
                 logger.info(f"[{connection.conn_id.hex()}] Connecting to {target_addr}:{target_port}")
 
                 # 发送连接请求到服务端
@@ -455,16 +703,9 @@ class SOCKS5Server:
                     logger.error(f"[{connection.conn_id.hex()}] Connect failed: {error_msg}")
                     await connection.socks5_connect_response(success=False, error_msg=error_msg)
 
-        except asyncio.CancelledError:
-            logger.debug(f"[{connection.conn_id.hex()}] Task cancelled")
-            raise
         except Exception as e:
-            logger.error(f"[{connection.conn_id.hex()}] Unexpected error: {e}")
-        finally:
-            # 延迟一点删除连接，给服务端发送关闭消息的时间
-            await asyncio.sleep(0.1)
-            if connection.conn_id in self.connections:
-                del self.connections[connection.conn_id]
+            logger.error(f"[{connection.conn_id.hex()}] SOCKS5 error: {e}")
+            raise
 
     async def _handle_udp_associate(self, connection: SOCKS5Connection, target_addr: str, target_port: int):
         """处理 UDP ASSOCIATE 请求"""
@@ -500,8 +741,8 @@ class SOCKS5Server:
         except Exception as e:
             logger.debug(f"[{connection.conn_id.hex()}] UDP ASSOCIATE connection error: {e}")
 
-    def get_connection(self, conn_id: bytes) -> Optional[SOCKS5Connection]:
-        """获取连接"""
+    def get_connection(self, conn_id: bytes) -> Optional[Union[SOCKS5Connection, HTTPConnectConnection]]:
+        """获取连接（支持 SOCKS5 和 HTTP CONNECT）"""
         return self.connections.get(conn_id)
 
     def get_udp_relay(self) -> Optional[UDPRelayServer]:
