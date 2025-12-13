@@ -221,7 +221,8 @@ class WebSocketClient:
                         ] = time.time()
                     await connection.send_to_client(data)
                 else:
-                    logger.warning(f"[{conn_id.hex()}] Connection not found")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.warning(f"[{conn_id.hex()}] Connection not found")
 
             elif msg_type == MSG_TYPE_CLOSE:
                 # 关闭连接（不再通知服务端，避免循环）
@@ -366,14 +367,16 @@ class WebSocketClient:
             await asyncio.sleep(delay)
 
             # 再次检查是否仍需缩容
+            current_count = sum(1 for ws in self.ws_pool if ws is not None)
             current_target = self._calculate_target_ws()
-            if current_target >= target:
-                logger.info(f"[Pool] Scale down cancelled: target changed to {current_target}")
+
+            # 如果当前连接数已经 <= 目标，或者重新计算的目标 > 缩容目标，取消缩容
+            if current_count <= target or current_target > target:
+                logger.info(f"[Pool] Scale down cancelled: current={current_count}, target={target}, recalc_target={current_target}")
                 self.scale_down_target = None
                 return
 
             # 执行缩容
-            current_count = sum(1 for ws in self.ws_pool if ws is not None)
             active_socks = self._get_active_socks_count()
             logger.info(f"[Pool] Scaling down: {current_count} → {target} WS connections (active_socks={active_socks})")
 
