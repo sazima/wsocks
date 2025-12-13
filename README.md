@@ -1,16 +1,17 @@
-# SOCKS5-WebSocket 代理
+# SOCKS5/HTTP WebSocket 代理
 
-基于 WebSocket 的 SOCKS5 代理工具，用于网络穿透和流量转发。
+基于 WebSocket 的代理工具，支持 SOCKS5 和 HTTP CONNECT 协议，用于网络穿透和流量转发。
 
 ## 原理
 
 ```
-本地应用 <--SOCKS5--> 客户端 <--WebSocket--> 服务端 <--TCP--> 目标服务器
+本地应用 <--SOCKS5/HTTP--> 客户端 <--WebSocket--> 服务端 <--TCP--> 目标服务器
 ```
 
-- **客户端**：在本地启动 SOCKS5 服务器，将流量通过 WebSocket 转发到远程服务端
+- **客户端**：在本地启动代理服务器（支持 SOCKS5 和 HTTP CONNECT），将流量通过 WebSocket 转发到远程服务端
 - **服务端**：接收 WebSocket 连接，代理访问目标服务器
-- 使用 WebSocket 连接池, 提升并发性能
+- 单端口自动识别协议类型（SOCKS5 / HTTP CONNECT）
+- 使用 WebSocket 连接池，提升并发性能
 - 通过密码和消息签名保证连接安全
 
 
