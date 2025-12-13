@@ -49,10 +49,13 @@ async def async_main():
         )
 
         # 创建 SOCKS5 服务器
+        udp_config = config.get('udp', {})
         socks5_server = SOCKS5Server(
             config['local']['host'],
             config['local']['port'],
-            ws_client
+            ws_client,
+            udp_enabled=udp_config.get('enabled', False),
+            udp_timeout=udp_config.get('timeout', 60)
         )
         ws_client.socks5_server = socks5_server
 

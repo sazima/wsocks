@@ -4,7 +4,7 @@ import random
 import time
 import os
 from typing import List, Optional
-from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT
+from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
 from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
@@ -211,6 +211,20 @@ class WebSocketClient:
             elif msg_type == MSG_TYPE_HEARTBEAT:
                 # 心跳响应，忽略即可（仅用于保持连接）
                 logger.debug(f"Received heartbeat response ({len(data)} bytes)")
+
+            elif msg_type == MSG_TYPE_UDP_DATA:
+                # UDP 数据消息，转发到 UDP relay
+                udp_relay = self.socks5_server.get_udp_relay()
+                if udp_relay:
+                    # 解析 UDP 数据包
+                    import ast
+                    udp_packet = ast.literal_eval(data.decode())
+                    dst_addr = udp_packet['dst_addr']
+                    dst_port = udp_packet['dst_port']
+                    payload = bytes.fromhex(udp_packet['data'])
+                    await udp_relay.send_to_client(conn_id, dst_addr, dst_port, payload)
+                else:
+                    logger.warning(f"[{conn_id.hex()}] UDP relay not available")
 
         except Exception as e:
             logger.error(f"Handle message error: {e}")
