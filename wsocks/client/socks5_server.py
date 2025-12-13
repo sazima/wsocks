@@ -234,7 +234,17 @@ class SOCKS5Server:
         """启动服务器"""
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.host, self.port))
+
+        try:
+            server_socket.bind((self.host, self.port))
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logger.error(f"Failed to start SOCKS5 server: Port {self.port} is already in use")
+                logger.error(f"Please check if another program is using port {self.port}, or change the port in config")
+                raise Exception(f"Port {self.port} already in use") from e
+            else:
+                raise
+
         server_socket.listen(100)
         server_socket.setblocking(False)
 
