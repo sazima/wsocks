@@ -2,9 +2,11 @@ import socket
 import struct
 import asyncio
 import os
-from typing import Dict, Optional
+import time
+import re
+from typing import Dict, Optional, Tuple, Union
 from wsocks.common.logger import setup_logger
-from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE
+from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_UDP_ASSOCIATE, MSG_TYPE_UDP_DATA
 
 logger = setup_logger()
 
@@ -19,52 +21,6 @@ class SOCKS5Connection:
         self.connect_success = False
         self.connect_error = None
 
-    async def handle(self):
-        """处理连接"""
-        try:
-            # SOCKS5 握手
-            await self.socks5_handshake()
-
-            # SOCKS5 连接请求（读取目标地址，但暂不回复）
-            target_addr, target_port = await self.socks5_connect_request_parse()
-
-            logger.info(f"[{self.conn_id.hex()}] Connecting to {target_addr}:{target_port}")
-
-            # 发送连接请求到服务端
-            connect_data = {
-                'host': target_addr,
-                'port': target_port
-            }
-            await self.ws_client.send_message(
-                MSG_TYPE_CONNECT,
-                self.conn_id,
-                str(connect_data).encode()
-            )
-
-            # 等待服务端连接响应（最多30秒）
-            try:
-                await asyncio.wait_for(self.connect_event.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.error(f"[{self.conn_id.hex()}] Connect timeout (30s)")
-                await self.socks5_connect_response(success=False, error_msg="Connection timeout")
-                return
-
-            # 检查连接结果
-            if self.connect_success:
-                # 连接成功，回复 SOCKS5 客户端
-                await self.socks5_connect_response(success=True)
-                # 开始转发数据
-                await self.forward_data()
-            else:
-                # 连接失败，回复错误
-                error_msg = self.connect_error or "Connection failed"
-                logger.error(f"[{self.conn_id.hex()}] Connect failed: {error_msg}")
-                await self.socks5_connect_response(success=False, error_msg=error_msg)
-
-        except Exception as e:
-            logger.error(f"[{self.conn_id.hex()}] Error: {e}")
-        finally:
-            await self.close()
 
     async def socks5_handshake(self):
         """SOCKS5 握手"""
@@ -91,7 +47,7 @@ class SOCKS5Connection:
         if version != 5:
             raise Exception(f"Unsupported SOCKS version: {version}")
 
-        if cmd != 1:  # 只支持 CONNECT
+        if cmd not in [1, 3]:  # 支持 CONNECT (1) 和 UDP ASSOCIATE (3)
             raise Exception(f"Unsupported command: {cmd}")
 
         # 读取目标地址
@@ -113,7 +69,7 @@ class SOCKS5Connection:
         port_data = await asyncio.get_event_loop().sock_recv(self.client_socket, 2)
         target_port = struct.unpack('!H', port_data)[0]
 
-        return target_addr, target_port
+        return cmd, target_addr, target_port
 
     async def socks5_connect_response(self, success: bool, error_msg: str = ""):
         """回复 SOCKS5 连接结果"""
@@ -222,19 +178,402 @@ class SOCKS5Connection:
             logger.debug(f"[{self.conn_id.hex()}] Failed to close socket: {e}")
 
 
+class HTTPConnectConnection:
+    """HTTP CONNECT 连接"""
+    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client, first_byte: bytes):
+        self.client_socket = client_socket
+        self.conn_id = conn_id
+        self.ws_client = ws_client
+        self.first_byte = first_byte  # 已读取的第一个字节
+        self.running = True
+        self.connect_event = asyncio.Event()
+        self.connect_success = False
+        self.connect_error = None
+
+    async def handle(self):
+        """处理 HTTP CONNECT 连接"""
+        try:
+            # 解析 HTTP CONNECT 请求
+            target_addr, target_port = await self.parse_connect_request()
+
+            logger.info(f"[{self.conn_id.hex()}] HTTP CONNECT to {target_addr}:{target_port}")
+
+            # 发送连接请求到服务端
+            connect_data = {
+                'host': target_addr,
+                'port': target_port
+            }
+            await self.ws_client.send_message(
+                MSG_TYPE_CONNECT,
+                self.conn_id,
+                str(connect_data).encode()
+            )
+
+            # 等待服务端连接响应（最多30秒）
+            try:
+                await asyncio.wait_for(self.connect_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(f"[{self.conn_id.hex()}] Connect timeout (30s)")
+                await self.send_connect_response(success=False)
+                return
+
+            # 检查连接结果
+            if self.connect_success:
+                # 连接成功，回复 HTTP 200
+                await self.send_connect_response(success=True)
+                # 开始转发数据
+                await self.forward_data()
+            else:
+                # 连接失败，回复错误
+                error_msg = self.connect_error or "Connection failed"
+                logger.error(f"[{self.conn_id.hex()}] Connect failed: {error_msg}")
+                await self.send_connect_response(success=False)
+
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] HTTP CONNECT error: {e}")
+        finally:
+            await self.close()
+
+    async def parse_connect_request(self):
+        """解析 HTTP CONNECT 请求"""
+        # 读取完整的请求行（包括已读的第一个字节）
+        request_line = self.first_byte
+
+        # 继续读取直到 \r\n
+        while b'\r\n' not in request_line:
+            chunk = await asyncio.get_event_loop().sock_recv(self.client_socket, 1024)
+            if not chunk:
+                raise Exception("Connection closed while reading HTTP request")
+            request_line += chunk
+            if len(request_line) > 8192:  # 防止恶意请求
+                raise Exception("HTTP request line too long")
+
+        # 提取第一行
+        first_line = request_line.split(b'\r\n')[0].decode('utf-8')
+
+        # 解析 CONNECT 请求: CONNECT host:port HTTP/1.1
+        match = re.match(r'^CONNECT\s+([^:]+):(\d+)\s+HTTP/\d\.\d$', first_line, re.IGNORECASE)
+        if not match:
+            raise Exception(f"Invalid CONNECT request: {first_line}")
+
+        target_addr = match.group(1)
+        target_port = int(match.group(2))
+
+        # 读取并丢弃剩余的 HTTP 头部（直到空行）
+        while b'\r\n\r\n' not in request_line:
+            chunk = await asyncio.get_event_loop().sock_recv(self.client_socket, 1024)
+            if not chunk:
+                break
+            request_line += chunk
+            if len(request_line) > 32768:  # 防止恶意请求
+                break
+
+        return target_addr, target_port
+
+    async def send_connect_response(self, success: bool):
+        """发送 HTTP CONNECT 响应"""
+        if success:
+            response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        else:
+            response = b"HTTP/1.1 502 Bad Gateway\r\n\r\n"
+
+        try:
+            await asyncio.get_event_loop().sock_sendall(self.client_socket, response)
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Failed to send HTTP response: {e}")
+
+    async def forward_data(self):
+        """转发数据（与 SOCKS5 相同）"""
+        loop = asyncio.get_event_loop()
+
+        while self.running:
+            try:
+                # 从本地客户端读取数据
+                data = await loop.sock_recv(self.client_socket, 65536)
+
+                if not data:
+                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    break
+
+                # 发送到服务端
+                await self.ws_client.send_message(
+                    MSG_TYPE_DATA,
+                    self.conn_id,
+                    data
+                )
+
+            except asyncio.CancelledError:
+                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                break
+            except OSError as e:
+                if e.errno == 9:  # Bad file descriptor
+                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                else:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                break
+            except Exception as e:
+                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                break
+
+    async def send_to_client(self, data: bytes):
+        """发送数据到本地客户端"""
+        try:
+            await asyncio.get_event_loop().sock_sendall(self.client_socket, data)
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send to client error: {e}")
+            await self.close()
+
+    def on_connect_success(self):
+        """连接成功回调"""
+        logger.info(f"[{self.conn_id.hex()}] Server connected successfully")
+        self.connect_success = True
+        self.connect_event.set()
+
+    def on_connect_failed(self, reason: str):
+        """连接失败回调"""
+        logger.warning(f"[{self.conn_id.hex()}] Server connect failed: {reason}")
+        self.connect_success = False
+        self.connect_error = reason
+        self.connect_event.set()
+
+    async def close(self, notify_server: bool = True):
+        """关闭连接"""
+        if not self.running:
+            return
+
+        self.running = False
+        logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        if notify_server:
+            try:
+                await self.ws_client.send_message(MSG_TYPE_CLOSE, self.conn_id, b'')
+            except Exception as e:
+                logger.debug(f"[{self.conn_id.hex()}] Failed to send close message: {e}")
+
+        try:
+            self.client_socket.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.05)
+
+        try:
+            self.client_socket.close()
+        except Exception as e:
+            logger.debug(f"[{self.conn_id.hex()}] Failed to close socket: {e}")
+
+
+class UDPRelayServer:
+    """UDP Relay 服务器 - 处理 SOCKS5 UDP Associate"""
+    def __init__(self, ws_client, udp_timeout: float = 60):
+        self.ws_client = ws_client
+        self.udp_timeout = udp_timeout
+        self.udp_socket: Optional[socket.socket] = None
+        self.udp_port = 0
+        self.udp_sessions: Dict[bytes, Tuple[str, int, float]] = {}  # conn_id -> (client_addr, client_port, last_activity)
+        self.running = False
+
+    async def start(self):
+        """启动 UDP relay 服务器"""
+        # 创建 UDP socket
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.bind(('127.0.0.1', 0))  # 绑定到随机端口
+        self.udp_socket.setblocking(False)
+        self.udp_port = self.udp_socket.getsockname()[1]
+
+        logger.info(f"UDP Relay server listening on 127.0.0.1:{self.udp_port}")
+
+        self.running = True
+
+        # 启动接收循环
+        asyncio.ensure_future(self._receive_loop())
+
+        # 启动清理超时会话的任务
+        asyncio.ensure_future(self._cleanup_sessions())
+
+    async def _receive_loop(self):
+        """接收 UDP 数据包"""
+        loop = asyncio.get_event_loop()
+
+        while self.running:
+            try:
+                # 接收数据包（最大 64KB）
+                data, addr = await loop.sock_recvfrom(self.udp_socket, 65535)
+
+                # 解析 SOCKS5 UDP 头
+                # 格式: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
+                if len(data) < 10:
+                    logger.warning(f"[UDP] Packet too short from {addr}")
+                    continue
+
+                rsv, frag, atyp = struct.unpack('!HBB', data[:4])
+
+                if frag != 0:
+                    logger.warning(f"[UDP] Fragmentation not supported from {addr}")
+                    continue
+
+                # 解析目标地址
+                offset = 4
+                if atyp == 1:  # IPv4
+                    dst_addr = socket.inet_ntoa(data[offset:offset+4])
+                    offset += 4
+                elif atyp == 3:  # 域名
+                    addr_len = data[offset]
+                    offset += 1
+                    dst_addr = data[offset:offset+addr_len].decode('utf-8')
+                    offset += addr_len
+                elif atyp == 4:  # IPv6
+                    dst_addr = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
+                    offset += 16
+                else:
+                    logger.warning(f"[UDP] Unsupported address type {atyp} from {addr}")
+                    continue
+
+                # 解析目标端口
+                dst_port = struct.unpack('!H', data[offset:offset+2])[0]
+                offset += 2
+
+                # 提取实际数据
+                payload = data[offset:]
+
+                logger.debug(f"[UDP] {addr} -> {dst_addr}:{dst_port} ({len(payload)} bytes)")
+
+                # 查找或创建会话
+                conn_id = self._find_or_create_session(addr)
+
+                # 通过 WebSocket 发送到服务端
+                udp_packet = {
+                    'dst_addr': dst_addr,
+                    'dst_port': dst_port,
+                    'data': payload.hex()  # 转为 hex 字符串
+                }
+                await self.ws_client.send_message(
+                    MSG_TYPE_UDP_DATA,
+                    conn_id,
+                    str(udp_packet).encode()
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[UDP] Receive error: {e}")
+                await asyncio.sleep(0.1)
+
+    def _find_or_create_session(self, addr: Tuple[str, int]) -> bytes:
+        """查找或创建 UDP 会话"""
+        client_addr, client_port = addr
+
+        # 查找现有会话
+        for conn_id, (c_addr, c_port, _) in self.udp_sessions.items():
+            if c_addr == client_addr and c_port == client_port:
+                # 更新活动时间
+                self.udp_sessions[conn_id] = (client_addr, client_port, time.time())
+                return conn_id
+
+        # 创建新会话
+        conn_id = os.urandom(4)
+        self.udp_sessions[conn_id] = (client_addr, client_port, time.time())
+        logger.info(f"[UDP] New session {conn_id.hex()} for {client_addr}:{client_port}")
+        return conn_id
+
+    async def send_to_client(self, conn_id: bytes, dst_addr: str, dst_port: int, data: bytes):
+        """发送数据到客户端"""
+        session = self.udp_sessions.get(conn_id)
+        if not session:
+            logger.warning(f"[UDP] Session {conn_id.hex()} not found")
+            return
+
+        client_addr, client_port, _ = session
+
+        # 构造 SOCKS5 UDP 响应
+        # RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
+        packet = struct.pack('!HBB', 0, 0, 1)  # RSV=0, FRAG=0, ATYP=IPv4
+
+        # 添加目标地址（使用发送方地址）
+        try:
+            packet += socket.inet_aton(dst_addr)
+        except:
+            # 如果是域名，转为 ATYP=3
+            packet = struct.pack('!HBB', 0, 0, 3)
+            packet += struct.pack('!B', len(dst_addr))
+            packet += dst_addr.encode()
+
+        packet += struct.pack('!H', dst_port)
+        packet += data
+
+        # 发送到客户端
+        try:
+            await asyncio.get_event_loop().sock_sendto(
+                self.udp_socket,
+                packet,
+                (client_addr, client_port)
+            )
+            logger.debug(f"[UDP] Sent {len(data)} bytes to {client_addr}:{client_port}")
+        except Exception as e:
+            logger.error(f"[UDP] Send error: {e}")
+
+    async def _cleanup_sessions(self):
+        """清理超时的 UDP 会话"""
+        while self.running:
+            try:
+                await asyncio.sleep(10)
+
+                now = time.time()
+                expired = []
+
+                for conn_id, (addr, port, last_activity) in self.udp_sessions.items():
+                    if now - last_activity > self.udp_timeout:
+                        expired.append(conn_id)
+
+                for conn_id in expired:
+                    logger.info(f"[UDP] Session {conn_id.hex()} expired")
+                    del self.udp_sessions[conn_id]
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[UDP] Cleanup error: {e}")
+
+    async def stop(self):
+        """停止 UDP relay 服务器"""
+        self.running = False
+        if self.udp_socket:
+            self.udp_socket.close()
+
+
 class SOCKS5Server:
     """SOCKS5 服务器"""
-    def __init__(self, host: str, port: int, ws_client):
+    def __init__(self, host: str, port: int, ws_client, udp_enabled: bool = False, udp_timeout: float = 60):
         self.host = host
         self.port = port
         self.ws_client = ws_client
-        self.connections: Dict[bytes, SOCKS5Connection] = {}
+        self.connections: Dict[bytes, Union[SOCKS5Connection, HTTPConnectConnection]] = {}
+        self.udp_enabled = udp_enabled
+        self.udp_relay: Optional[UDPRelayServer] = None
+
+        # 如果启用 UDP，创建 UDP relay 服务器
+        if udp_enabled:
+            self.udp_relay = UDPRelayServer(ws_client, udp_timeout)
 
     async def start(self):
         """启动服务器"""
+        # 如果启用 UDP，先启动 UDP relay
+        if self.udp_enabled and self.udp_relay:
+            await self.udp_relay.start()
+
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.host, self.port))
+
+        try:
+            server_socket.bind((self.host, self.port))
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logger.error(f"Failed to start SOCKS5 server: Port {self.port} is already in use")
+                logger.error(f"Please check if another program is using port {self.port}, or change the port in config")
+                raise Exception(f"Port {self.port} already in use") from e
+            else:
+                raise
+
         server_socket.listen(100)
         server_socket.setblocking(False)
 
@@ -249,28 +588,163 @@ class SOCKS5Server:
             # 生成连接 ID
             conn_id = os.urandom(4)
 
-            # 创建连接处理
-            connection = SOCKS5Connection(client_socket, conn_id, self.ws_client)
-            self.connections[conn_id] = connection
+            # 异步处理连接（带协议自动检测）
+            asyncio.ensure_future(self._handle_connection(client_socket, conn_id, addr))
 
-            # 异步处理连接
-            asyncio.ensure_future(self._handle_connection(connection))
-
-    async def _handle_connection(self, connection: SOCKS5Connection):
-        """处理连接"""
+    async def _handle_connection(self, client_socket: socket.socket, conn_id: bytes, addr):
+        """处理连接（带协议自动检测）"""
+        connection = None
         try:
-            await connection.handle()
+            # 读取第一个字节以检测协议类型
+            first_byte = await asyncio.get_event_loop().sock_recv(client_socket, 1)
+
+            if not first_byte:
+                logger.warning(f"[{conn_id.hex()}] Connection closed immediately")
+                client_socket.close()
+                return
+
+            protocol_byte = first_byte[0]
+
+            # 协议检测
+            if protocol_byte == 0x05:
+                # SOCKS5 协议
+                logger.debug(f"[{conn_id.hex()}] Detected SOCKS5 protocol")
+                connection = SOCKS5Connection(client_socket, conn_id, self.ws_client)
+                self.connections[conn_id] = connection
+
+                # 处理 SOCKS5 握手（第一个字节已经读取）
+                await self._handle_socks5_connection(connection, first_byte)
+
+            elif protocol_byte == 0x43:  # 'C' - 可能是 "CONNECT"
+                # HTTP CONNECT 协议
+                logger.debug(f"[{conn_id.hex()}] Detected HTTP CONNECT protocol")
+                connection = HTTPConnectConnection(client_socket, conn_id, self.ws_client, first_byte)
+                self.connections[conn_id] = connection
+
+                # 处理 HTTP CONNECT
+                await connection.handle()
+
+            else:
+                # 未知协议
+                logger.warning(f"[{conn_id.hex()}] Unknown protocol (first byte: {protocol_byte:#x})")
+                try:
+                    client_socket.close()
+                except:
+                    pass
+                return
+
         except asyncio.CancelledError:
-            logger.debug(f"[{connection.conn_id.hex()}] Task cancelled")
+            logger.debug(f"[{conn_id.hex()}] Task cancelled")
             raise
         except Exception as e:
-            logger.error(f"[{connection.conn_id.hex()}] Unexpected error: {e}")
+            logger.error(f"[{conn_id.hex()}] Unexpected error: {e}")
+            # 确保 socket 被关闭
+            try:
+                client_socket.close()
+            except:
+                pass
         finally:
             # 延迟一点删除连接，给服务端发送关闭消息的时间
             await asyncio.sleep(0.1)
-            if connection.conn_id in self.connections:
-                del self.connections[connection.conn_id]
+            if conn_id in self.connections:
+                del self.connections[conn_id]
 
-    def get_connection(self, conn_id: bytes) -> Optional[SOCKS5Connection]:
-        """获取连接"""
+    async def _handle_socks5_connection(self, connection: SOCKS5Connection, first_byte: bytes):
+        """处理 SOCKS5 连接"""
+        try:
+            # 继续 SOCKS5 握手（第一个字节已经读取是 0x05）
+            data = first_byte + await asyncio.get_event_loop().sock_recv(connection.client_socket, 1)
+            version, nmethods = struct.unpack('!BB', data)
+
+            # 读取认证方法
+            methods = await asyncio.get_event_loop().sock_recv(connection.client_socket, nmethods)
+
+            # 回复：无需认证
+            response = struct.pack('!BB', 5, 0)
+            await asyncio.get_event_loop().sock_sendall(connection.client_socket, response)
+
+            # 解析请求
+            cmd, target_addr, target_port = await connection.socks5_connect_request_parse()
+
+            if cmd == 3:  # UDP ASSOCIATE
+                await self._handle_udp_associate(connection, target_addr, target_port)
+            else:  # CONNECT
+                # TCP CONNECT
+                logger.info(f"[{connection.conn_id.hex()}] Connecting to {target_addr}:{target_port}")
+
+                # 发送连接请求到服务端
+                connect_data = {
+                    'host': target_addr,
+                    'port': target_port
+                }
+                await connection.ws_client.send_message(
+                    MSG_TYPE_CONNECT,
+                    connection.conn_id,
+                    str(connect_data).encode()
+                )
+
+                # 等待服务端连接响应（最多30秒）
+                try:
+                    await asyncio.wait_for(connection.connect_event.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.error(f"[{connection.conn_id.hex()}] Connect timeout (30s)")
+                    await connection.socks5_connect_response(success=False, error_msg="Connection timeout")
+                    return
+
+                # 检查连接结果
+                if connection.connect_success:
+                    # 连接成功，回复 SOCKS5 客户端
+                    await connection.socks5_connect_response(success=True)
+                    # 开始转发数据
+                    await connection.forward_data()
+                else:
+                    # 连接失败，回复错误
+                    error_msg = connection.connect_error or "Connection failed"
+                    logger.error(f"[{connection.conn_id.hex()}] Connect failed: {error_msg}")
+                    await connection.socks5_connect_response(success=False, error_msg=error_msg)
+
+        except Exception as e:
+            logger.error(f"[{connection.conn_id.hex()}] SOCKS5 error: {e}")
+            raise
+
+    async def _handle_udp_associate(self, connection: SOCKS5Connection, target_addr: str, target_port: int):
+        """处理 UDP ASSOCIATE 请求"""
+        if not self.udp_enabled or not self.udp_relay:
+            logger.warning(f"[{connection.conn_id.hex()}] UDP ASSOCIATE requested but UDP is disabled")
+            await connection.socks5_connect_response(success=False, error_msg="UDP not supported")
+            return
+
+        logger.info(f"[{connection.conn_id.hex()}] UDP ASSOCIATE request")
+
+        # 回复 UDP relay 地址
+        # 格式: VER(1) | REP(1) | RSV(1) | ATYP(1) | BND.ADDR | BND.PORT
+        response = struct.pack('!BBBB', 5, 0, 0, 1)  # 成功
+        response += socket.inet_aton('127.0.0.1')  # UDP relay 地址
+        response += struct.pack('!H', self.udp_relay.udp_port)  # UDP relay 端口
+
+        try:
+            await asyncio.get_event_loop().sock_sendall(connection.client_socket, response)
+            logger.info(f"[{connection.conn_id.hex()}] UDP relay available at 127.0.0.1:{self.udp_relay.udp_port}")
+        except Exception as e:
+            logger.error(f"[{connection.conn_id.hex()}] Failed to send UDP ASSOCIATE response: {e}")
+            return
+
+        # 保持 TCP 连接活跃（当 TCP 连接关闭时，UDP 会话也应该结束）
+        # 这里简单地等待连接关闭
+        try:
+            while True:
+                data = await asyncio.get_event_loop().sock_recv(connection.client_socket, 1024)
+                if not data:
+                    logger.info(f"[{connection.conn_id.hex()}] UDP ASSOCIATE TCP connection closed")
+                    break
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.debug(f"[{connection.conn_id.hex()}] UDP ASSOCIATE connection error: {e}")
+
+    def get_connection(self, conn_id: bytes) -> Optional[Union[SOCKS5Connection, HTTPConnectConnection]]:
+        """获取连接（支持 SOCKS5 和 HTTP CONNECT）"""
         return self.connections.get(conn_id)
+
+    def get_udp_relay(self) -> Optional[UDPRelayServer]:
+        """获取 UDP relay 服务器"""
+        return self.udp_relay

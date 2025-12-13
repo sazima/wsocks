@@ -1,7 +1,9 @@
 import asyncio
-from typing import Dict
+import socket
+import time
+from typing import Dict, Tuple, Optional
 import tornado.websocket
-from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT
+from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
 from wsocks.common.logger import setup_logger
 from wsocks.server.tcp_client import TargetConnection
 
@@ -16,6 +18,7 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         self.max_connections = max_connections
         self.buffer_size = buffer_size
         self.connections: Dict[bytes, TargetConnection] = {}
+        self.udp_sessions: Dict[bytes, Tuple[socket.socket, str, int, float]] = {}  # conn_id -> (udp_socket, dst_addr, dst_port, last_activity)
 
     def check_origin(self, origin):
         return True
@@ -46,6 +49,9 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                 logger.debug(f"Received heartbeat ({len(data)} bytes)")
                 # 可以选择回应心跳或仅忽略
                 # asyncio.ensure_future(self.send_heartbeat_response(conn_id, data))
+            elif msg_type == MSG_TYPE_UDP_DATA:
+                # UDP 数据消息
+                asyncio.ensure_future(self.handle_udp_data(conn_id, data))
 
         except ValueError as e:
             logger.error(f"Invalid message: {e}")
@@ -139,9 +145,110 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         # 使用 pop 避免并发删除时的 KeyError
         self.connections.pop(conn_id, None)
 
+    async def handle_udp_data(self, conn_id: bytes, data: bytes):
+        """处理 UDP 数据"""
+        try:
+            # 解析 UDP 数据包
+            import ast
+            udp_packet = ast.literal_eval(data.decode())
+            dst_addr = udp_packet['dst_addr']
+            dst_port = udp_packet['dst_port']
+            payload = bytes.fromhex(udp_packet['data'])
+
+            logger.debug(f"[UDP-{conn_id.hex()}] -> {dst_addr}:{dst_port} ({len(payload)} bytes)")
+
+            # 查找或创建 UDP socket
+            udp_socket = await self._get_or_create_udp_socket(conn_id, dst_addr, dst_port)
+
+            # 发送数据
+            await asyncio.get_event_loop().sock_sendto(udp_socket, payload, (dst_addr, dst_port))
+
+            # 更新活动时间
+            if conn_id in self.udp_sessions:
+                sock, addr, port, _ = self.udp_sessions[conn_id]
+                self.udp_sessions[conn_id] = (sock, addr, port, time.time())
+
+        except Exception as e:
+            logger.error(f"[UDP-{conn_id.hex()}] Error: {e}")
+
+    async def _get_or_create_udp_socket(self, conn_id: bytes, dst_addr: str, dst_port: int) -> socket.socket:
+        """获取或创建 UDP socket"""
+        # 检查是否已有会话
+        if conn_id in self.udp_sessions:
+            udp_socket, _, _, _ = self.udp_sessions[conn_id]
+            return udp_socket
+
+        # 创建新的 UDP socket
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.setblocking(False)
+
+        # 保存会话
+        self.udp_sessions[conn_id] = (udp_socket, dst_addr, dst_port, time.time())
+
+        logger.info(f"[UDP-{conn_id.hex()}] New UDP session for {dst_addr}:{dst_port}")
+
+        # 启动接收任务
+        asyncio.ensure_future(self._udp_receive_loop(conn_id, udp_socket, dst_addr, dst_port))
+
+        return udp_socket
+
+    async def _udp_receive_loop(self, conn_id: bytes, udp_socket: socket.socket, dst_addr: str, dst_port: int):
+        """接收 UDP 响应"""
+        try:
+            while conn_id in self.udp_sessions:
+                try:
+                    # 接收数据（超时 60 秒）
+                    data, addr = await asyncio.wait_for(
+                        asyncio.get_event_loop().sock_recvfrom(udp_socket, 65535),
+                        timeout=60.0
+                    )
+
+                    logger.debug(f"[UDP-{conn_id.hex()}] <- {addr} ({len(data)} bytes)")
+
+                    # 发送回客户端
+                    udp_response = {
+                        'dst_addr': addr[0],
+                        'dst_port': addr[1],
+                        'data': data.hex()
+                    }
+                    packed_data = Protocol.pack(MSG_TYPE_UDP_DATA, conn_id, str(udp_response).encode(), self.password)
+                    await self.write_message(packed_data, binary=True)
+
+                    # 更新活动时间
+                    if conn_id in self.udp_sessions:
+                        sock, dst_a, dst_p, _ = self.udp_sessions[conn_id]
+                        self.udp_sessions[conn_id] = (sock, dst_a, dst_p, time.time())
+
+                except asyncio.TimeoutError:
+                    # 超时，关闭会话
+                    logger.info(f"[UDP-{conn_id.hex()}] Session timeout")
+                    break
+                except Exception as e:
+                    logger.error(f"[UDP-{conn_id.hex()}] Receive error: {e}")
+                    break
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[UDP-{conn_id.hex()}] Loop error: {e}")
+        finally:
+            # 清理会话
+            if conn_id in self.udp_sessions:
+                udp_socket.close()
+                del self.udp_sessions[conn_id]
+                logger.info(f"[UDP-{conn_id.hex()}] Session closed")
+
     def on_close(self):
         logger.info("Client disconnected")
         # 清理所有连接
         for connection in list(self.connections.values()):
             asyncio.ensure_future(connection.close())
         self.connections.clear()
+
+        # 清理所有 UDP 会话
+        for conn_id, (udp_socket, _, _, _) in list(self.udp_sessions.items()):
+            try:
+                udp_socket.close()
+            except:
+                pass
+        self.udp_sessions.clear()

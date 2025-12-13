@@ -31,38 +31,69 @@ async def async_main():
 
     # 创建 SOCKS5 服务器（先创建以便 ws_client 引用）
     socks5_server = None
+    ws_client = None
 
-    # 创建 WebSocket 客户端
-    ws_client = WebSocketClient(
-        config['server']['url'],
-        config['server']['password'],
-        None,  # 稍后设置
-        ping_interval=config['server'].get('ping_interval', 30),
-        ping_timeout=config['server'].get('ping_timeout', 10),
-        compression=config['server'].get('compression', True),
-        pool_size=config['server'].get('ws_pool_size', 8),
-        heartbeat_enabled=config['server'].get('heartbeat_enabled', True),
-        heartbeat_min=config['server'].get('heartbeat_min', 20),
-        heartbeat_max=config['server'].get('heartbeat_max', 50)
-    )
+    try:
+        # 创建 WebSocket 客户端
+        ws_client = WebSocketClient(
+            config['server']['url'],
+            config['server']['password'],
+            None,  # 稍后设置
+            ping_interval=config['server'].get('ping_interval', 30),
+            ping_timeout=config['server'].get('ping_timeout', 10),
+            compression=config['server'].get('compression', True),
+            pool_size=config['server'].get('ws_pool_size', 8),
+            heartbeat_enabled=config['server'].get('heartbeat_enabled', True),
+            heartbeat_min=config['server'].get('heartbeat_min', 20),
+            heartbeat_max=config['server'].get('heartbeat_max', 50)
+        )
 
-    # 创建 SOCKS5 服务器
-    socks5_server = SOCKS5Server(
-        config['local']['host'],
-        config['local']['port'],
-        ws_client
-    )
-    ws_client.socks5_server = socks5_server
+        # 创建 SOCKS5 服务器
+        udp_config = config.get('udp', {})
+        socks5_server = SOCKS5Server(
+            config['local']['host'],
+            config['local']['port'],
+            ws_client,
+            udp_enabled=udp_config.get('enabled', False),
+            udp_timeout=udp_config.get('timeout', 60)
+        )
+        ws_client.socks5_server = socks5_server
 
-    # 启动两个任务
-    await asyncio.gather(
-        socks5_server.start(),
-        ws_client.connect()
-    )
+        # 启动两个任务
+        await asyncio.gather(
+            socks5_server.start(),
+            ws_client.connect()
+        )
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        # 清理资源
+        if ws_client:
+            try:
+                await ws_client.close()
+            except Exception as cleanup_error:
+                logger.debug(f"Error during cleanup: {cleanup_error}")
+        raise
 
 def main():
     """Entry point for console script"""
-    asyncio.run(async_main())
+    # Python 3.6 兼容：使用 get_event_loop() 而不是 asyncio.run()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(async_main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        # 错误已经在 async_main 中记录过了，这里只需要退出
+        pass
+    finally:
+        # 取消所有待处理的任务
+        pending = asyncio.Task.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        # 等待所有任务取消完成
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
 
 if __name__ == '__main__':
     main()

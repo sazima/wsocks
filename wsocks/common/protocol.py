@@ -9,6 +9,8 @@ MSG_TYPE_CLOSE = 3           # 关闭连接
 MSG_TYPE_HEARTBEAT = 4       # 心跳
 MSG_TYPE_CONNECT_SUCCESS = 5 # 连接成功响应
 MSG_TYPE_CONNECT_FAILED = 6  # 连接失败响应
+MSG_TYPE_UDP_ASSOCIATE = 7   # UDP Associate 请求
+MSG_TYPE_UDP_DATA = 8        # UDP 数据包
 
 class Protocol:
     """
