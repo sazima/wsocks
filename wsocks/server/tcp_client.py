@@ -17,6 +17,7 @@ class TargetConnection:
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.running = False
+        self._read_task: Optional[asyncio.Task] = None
 
     async def connect(self):
         """连接到目标服务器"""
@@ -34,8 +35,8 @@ class TargetConnection:
             self.running = True
             logger.info(f"[{self.conn_id.hex()}] Connected to {self.host}:{self.port}")
 
-            # 开始读取数据
-            asyncio.ensure_future(self.read_loop())
+            # 开始读取数据，保存任务引用以便后续取消
+            self._read_task = asyncio.ensure_future(self.read_loop())
 
         except asyncio.TimeoutError:
             logger.error(f"[{self.conn_id.hex()}] Connect timeout: {self.host}:{self.port}")
@@ -58,6 +59,10 @@ class TargetConnection:
                 # 发送回客户端
                 await self.ws_handler.send_data(self.conn_id, data)
 
+        except asyncio.CancelledError:
+            # 任务被取消，这是正常的关闭流程
+            logger.debug(f"[{self.conn_id.hex()}] Read loop cancelled")
+            raise  # 重新抛出 CancelledError，确保任务正确结束
         except Exception as e:
             logger.error(f"[{self.conn_id.hex()}] Read error: {e}")
         finally:
@@ -85,6 +90,16 @@ class TargetConnection:
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing target connection")
+
+        # 立即取消 read_loop 任务，避免阻塞在读取上
+        if self._read_task and not self._read_task.done():
+            self._read_task.cancel()
+            try:
+                await self._read_task
+            except asyncio.CancelledError:
+                logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
+            except Exception as e:
+                logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
 
         if self.writer:
             try:

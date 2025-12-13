@@ -1,4 +1,6 @@
 import asyncio
+import logging
+
 import websockets
 import random
 import time
@@ -29,6 +31,8 @@ class WebSocketClient:
         self.heartbeat_min = heartbeat_min
         self.heartbeat_max = heartbeat_max
         self.last_activity_time: List[float] = [0] * pool_size  # 每个连接的最后活动时间
+        self.last_business_activity_time: List[float] = [0] * pool_size
+        self.last_heartbeat_time: List[float] = [0] * pool_size
 
         # 动态连接池管理
         self.target_ws_count = 1  # 当前目标连接数，初始为1
@@ -70,6 +74,8 @@ class WebSocketClient:
                     )
                     self.ws_pool[index] = ws
                     self.last_activity_time[index] = time.time()
+                    self.last_business_activity_time[index] = 0
+                    self.last_heartbeat_time[index] = 0
 
                     heartbeat_mode = "app-layer random" if self.heartbeat_enabled else f"native {self.ping_interval}s"
                     logger.info(f"[WS-{index}] Connected (compression={self.compression}, heartbeat={heartbeat_mode})")
@@ -118,55 +124,69 @@ class WebSocketClient:
             self.ws_pool[index] = None
 
     async def _heartbeat_loop(self, index: int, ws: websockets.WebSocketClientProtocol):
-        """应用层心跳循环（随机间隔和数据大小，支持闲置模式）"""
         try:
             while self.running and self.ws_pool[index] is not None:
-                # 检查是否处于闲置模式
                 active_socks = self._get_active_socks_count()
                 is_idle = (active_socks == 0)
 
-                # 根据模式选择心跳间隔
+                # 心跳间隔
                 if is_idle:
-                    # 闲置模式：使用 heartbeat_max 周围的随机间隔（±20%）
-                    interval = self.heartbeat_max * random.uniform(0.8, 1.2)
+                    interval = self.heartbeat_max * random.uniform(0.8, 1.0)
                 else:
-                    # 活跃模式：使用 heartbeat_min ~ heartbeat_max 随机间隔
                     interval = random.uniform(self.heartbeat_min, self.heartbeat_max)
 
                 await asyncio.sleep(interval)
 
-                # 检查连接是否仍然存活
                 if self.ws_pool[index] is None:
                     break
 
-                # 如果最近有业务流量，跳过心跳（避免不必要的特征）
-                time_since_last_activity = time.time() - self.last_activity_time[index]
-                min_interval = self.heartbeat_max if is_idle else self.heartbeat_min
-                if time_since_last_activity < min_interval:
-                    logger.debug(f"[WS-{index}] Skip heartbeat (recent activity: {time_since_last_activity:.1f}s ago)")
+                now = time.time()
+
+                # ★ 只看「业务活动」
+                last_business = self.last_business_activity_time[index]
+                time_since_business = (
+                    now - last_business if last_business > 0 else float('inf')
+                )
+
+                # 最近有业务流量 → 跳过心跳
+                threshold = self.heartbeat_max if is_idle else self.heartbeat_min
+                if time_since_business < threshold:
+                    logger.debug(
+                        f"[WS-{index}] Skip heartbeat "
+                        f"(recent business activity: {time_since_business:.1f}s ago)"
+                    )
                     continue
 
-                # 生成随机大小的心跳数据（100-2000 字节，模拟真实业务数据）
+                # 构造心跳数据
                 data_size = random.randint(100, 2000)
                 heartbeat_data = os.urandom(data_size)
-
-                # 使用一个特殊的 conn_id 发送心跳
                 heartbeat_conn_id = b'\x00\x00\x00\x00'
-                packed_data = Protocol.pack(MSG_TYPE_HEARTBEAT, heartbeat_conn_id, heartbeat_data, self.password)
+
+                packed_data = Protocol.pack(
+                    MSG_TYPE_HEARTBEAT,
+                    heartbeat_conn_id,
+                    heartbeat_data,
+                    self.password
+                )
 
                 try:
                     await ws.send(packed_data)
-                    self.last_activity_time[index] = time.time()
+                    self.last_heartbeat_time[index] = now
+                    self.last_activity_time[index] = now
+
                     mode = "idle" if is_idle else "active"
-                    logger.debug(f"[WS-{index}] Sent heartbeat ({data_size} bytes, interval={interval:.1f}s, mode={mode})")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"[WS-{index}] Sent heartbeat "
+                            f"({data_size} bytes, mode={mode})"
+                        )
+
                 except Exception as e:
                     logger.warning(f"[WS-{index}] Heartbeat send failed: {e}")
                     break
 
         except asyncio.CancelledError:
             logger.debug(f"[WS-{index}] Heartbeat loop cancelled")
-        except Exception as e:
-            logger.error(f"[WS-{index}] Heartbeat loop error: {e}")
 
     async def handle_message(self, raw_data: bytes):
         """处理接收到的消息"""
@@ -196,6 +216,9 @@ class WebSocketClient:
             elif msg_type == MSG_TYPE_DATA:
                 # 数据消息，转发到本地客户端
                 if connection:
+                    self.last_business_activity_time[
+                        int.from_bytes(conn_id, 'big') % self.pool_size
+                        ] = time.time()
                     await connection.send_to_client(data)
                 else:
                     logger.warning(f"[{conn_id.hex()}] Connection not found")
@@ -222,6 +245,9 @@ class WebSocketClient:
                     dst_addr = udp_packet['dst_addr']
                     dst_port = udp_packet['dst_port']
                     payload = bytes.fromhex(udp_packet['data'])
+                    self.last_business_activity_time[
+                        int.from_bytes(conn_id, 'big') % self.pool_size
+                        ] = time.time()
                     await udp_relay.send_to_client(conn_id, dst_addr, dst_port, payload)
                 else:
                     logger.warning(f"[{conn_id.hex()}] UDP relay not available")
@@ -247,6 +273,8 @@ class WebSocketClient:
 
             if ws is not None:
                 try:
+                    self.last_activity_time[current_index] = time.time()
+                    self.last_business_activity_time[current_index] = time.time()
                     await ws.send(packed_data)
                     self.last_activity_time[current_index] = time.time()  # 更新活动时间
                     return
@@ -299,28 +327,38 @@ class WebSocketClient:
             self.target_ws_count = target
 
         elif target < current_count:
-            # 缩容：延迟执行
-            # 检查是否已有相同目标的缩容任务正在进行
-            if self.scale_down_task and not self.scale_down_task.done() and self.scale_down_target == target:
-                # 已有相同目标的缩容任务，不需要重新调度
-                logger.debug(f"[Pool] Scale down task already scheduled for target {target}, skipping")
+            # 已有相同目标缩容任务 → 不重复调度
+            if (
+                    self.scale_down_task
+                    and not self.scale_down_task.done()
+                    and self.scale_down_target == target
+            ):
                 return
 
+            # 计算 delay（只算一次）
             if active_socks == 0:
-                delay = random.uniform(180, 300)  # 闲置模式：3-5分钟
-                logger.info(f"[Pool] Scheduling scale down to idle mode: {current_count} → 1 WS (delay={delay:.0f}s)")
+                delay = random.uniform(180, 300)
+                logger.info(
+                    f"[Pool] Scheduling scale down to idle mode: "
+                    f"{current_count} → {target} WS (delay={delay:.0f}s)"
+                )
             else:
-                delay = random.uniform(60, 120)  # 活跃模式：1-2分钟
-                logger.info(f"[Pool] Scheduling scale down: {current_count} → {target} WS (delay={delay:.0f}s, active_socks={active_socks})")
+                delay = random.uniform(60, 120)
+                logger.info(
+                    f"[Pool] Scheduling scale down: "
+                    f"{current_count} → {target} WS "
+                    f"(delay={delay:.0f}s, active_socks={active_socks})"
+                )
 
-            # 取消之前的缩容任务（如果目标不同）
+            # 取消旧任务（如果目标不同）
             if self.scale_down_task and not self.scale_down_task.done():
-                logger.debug(f"[Pool] Cancelling previous scale down task (old target={self.scale_down_target}, new target={target})")
                 self.scale_down_task.cancel()
 
-            # 启动新的缩容任务
             self.scale_down_target = target
-            self.scale_down_task = asyncio.ensure_future(self._scale_down_delayed(target, delay))
+            self.scale_down_task = asyncio.ensure_future(
+                self._scale_down_delayed(target, delay)
+            )
+
 
     async def _scale_down_delayed(self, target: int, delay: float):
         """延迟缩容（防止抖动）"""

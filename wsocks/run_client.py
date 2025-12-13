@@ -27,6 +27,11 @@ async def async_main():
         logger.error(f"配置文件格式错误: {e}")
         return
 
+    # 应用配置文件中的日志等级
+    log_level = config.get('log_level', 'INFO')
+    setup_logger(log_level)
+    logger.info(f"Log level set to: {log_level}")
+
     logger.info("Starting SOCKS5-WS Proxy Client")
 
     # 创建 SOCKS5 服务器（先创建以便 ws_client 引用）
