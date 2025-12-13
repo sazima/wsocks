@@ -34,6 +34,7 @@ class WebSocketClient:
         self.target_ws_count = 1  # 当前目标连接数，初始为1
         self.ws_tasks: List[Optional[asyncio.Task]] = [None] * pool_size  # 每个连接的任务
         self.scale_down_task: Optional[asyncio.Task] = None  # 缩容延迟任务
+        self.scale_down_target: Optional[int] = None  # 缩容任务的目标值
         self.monitor_task: Optional[asyncio.Task] = None  # 监控任务
 
     async def connect(self):
@@ -270,6 +271,7 @@ class WebSocketClient:
             if self.scale_down_task and not self.scale_down_task.done():
                 self.scale_down_task.cancel()
                 self.scale_down_task = None
+                self.scale_down_target = None
 
             # 创建新连接
             for i in range(self.pool_size):
@@ -284,6 +286,12 @@ class WebSocketClient:
 
         elif target < current_count:
             # 缩容：延迟执行
+            # 检查是否已有相同目标的缩容任务正在进行
+            if self.scale_down_task and not self.scale_down_task.done() and self.scale_down_target == target:
+                # 已有相同目标的缩容任务，不需要重新调度
+                logger.debug(f"[Pool] Scale down task already scheduled for target {target}, skipping")
+                return
+
             if active_socks == 0:
                 delay = random.uniform(180, 300)  # 闲置模式：3-5分钟
                 logger.info(f"[Pool] Scheduling scale down to idle mode: {current_count} → 1 WS (delay={delay:.0f}s)")
@@ -291,11 +299,13 @@ class WebSocketClient:
                 delay = random.uniform(60, 120)  # 活跃模式：1-2分钟
                 logger.info(f"[Pool] Scheduling scale down: {current_count} → {target} WS (delay={delay:.0f}s, active_socks={active_socks})")
 
-            # 取消之前的缩容任务
+            # 取消之前的缩容任务（如果目标不同）
             if self.scale_down_task and not self.scale_down_task.done():
+                logger.debug(f"[Pool] Cancelling previous scale down task (old target={self.scale_down_target}, new target={target})")
                 self.scale_down_task.cancel()
 
             # 启动新的缩容任务
+            self.scale_down_target = target
             self.scale_down_task = asyncio.ensure_future(self._scale_down_delayed(target, delay))
 
     async def _scale_down_delayed(self, target: int, delay: float):
@@ -307,6 +317,7 @@ class WebSocketClient:
             current_target = self._calculate_target_ws()
             if current_target >= target:
                 logger.info(f"[Pool] Scale down cancelled: target changed to {current_target}")
+                self.scale_down_target = None
                 return
 
             # 执行缩容
@@ -341,11 +352,14 @@ class WebSocketClient:
                     closed += 1
 
             self.target_ws_count = target
+            self.scale_down_target = None  # 缩容完成，清除目标
 
         except asyncio.CancelledError:
             logger.debug("[Pool] Scale down task cancelled")
+            self.scale_down_target = None  # 任务被取消，清除目标
         except Exception as e:
             logger.error(f"[Pool] Scale down error: {e}")
+            self.scale_down_target = None  # 出错，清除目标
 
     async def _monitor_and_scale(self):
         """监控并定期调整连接池"""
