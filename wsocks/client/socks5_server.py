@@ -706,6 +706,9 @@ class SOCKS5Server:
         except Exception as e:
             logger.error(f"[{connection.conn_id.hex()}] SOCKS5 error: {e}")
             raise
+        finally:
+            # 确保连接被正确关闭并通知服务端
+            await connection.close()
 
     async def _handle_udp_associate(self, connection: SOCKS5Connection, target_addr: str, target_port: int):
         """处理 UDP ASSOCIATE 请求"""
