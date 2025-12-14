@@ -380,7 +380,9 @@ class WebSocketClient:
             # 如果当前连接数已经 <= 目标，或者重新计算的目标 > 缩容目标，取消缩容
             if current_count <= target or current_target > target:
                 logger.info(f"[Pool] Scale down cancelled: current={current_count}, target={target}, recalc_target={current_target}")
-                self.scale_down_target = None
+                # 只有当 target 仍然匹配时才清理（避免覆盖新任务的设置）
+                if self.scale_down_target == target:
+                    self.scale_down_target = None
                 return
 
             # 执行缩容
@@ -414,14 +416,20 @@ class WebSocketClient:
                     closed += 1
 
             self.target_ws_count = target
-            self.scale_down_target = None  # 缩容完成，清除目标
+            # 缩容完成，清除目标（只有当 target 仍然匹配时才清理）
+            if self.scale_down_target == target:
+                self.scale_down_target = None
 
         except asyncio.CancelledError:
             logger.debug("[Pool] Scale down task cancelled")
-            self.scale_down_target = None  # 任务被取消，清除目标
+            # 只有当 target 仍然匹配时才清理（避免覆盖新任务的设置）
+            if self.scale_down_target == target:
+                self.scale_down_target = None
         except Exception as e:
             logger.error(f"[Pool] Scale down error: {e}")
-            self.scale_down_target = None  # 出错，清除目标
+            # 只有当 target 仍然匹配时才清理（避免覆盖新任务的设置）
+            if self.scale_down_target == target:
+                self.scale_down_target = None
 
     async def _monitor_and_scale(self):
         """监控并定期调整连接池"""
