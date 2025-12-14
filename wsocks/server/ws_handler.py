@@ -107,9 +107,12 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
     async def handle_close(self, conn_id: bytes):
         """处理关闭请求"""
+        logger.info(f"[{conn_id.hex()}] Received CLOSE message from client")
         connection = self.connections.pop(conn_id, None)
         if connection:
             await connection.close()
+        else:
+            logger.warning(f"[{conn_id.hex()}] Connection not found in handle_close")
 
     async def send_data(self, conn_id: bytes, data: bytes):
         """发送数据到客户端"""

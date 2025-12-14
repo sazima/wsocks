@@ -18,6 +18,7 @@ class TargetConnection:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.running = False
         self._read_task: Optional[asyncio.Task] = None
+        self._closing = False  # 防止并发关闭
 
     async def connect(self):
         """连接到目标服务器"""
@@ -85,21 +86,35 @@ class TargetConnection:
 
     async def close(self):
         """关闭连接"""
+        # 防止并发关闭：只允许第一个 close() 调用执行完整的清理流程
+        if self._closing:
+            logger.debug(f"[{self.conn_id.hex()}] Already in closing process, skipping")
+            return
+
+        self._closing = True
+
         if not self.running:
+            logger.debug(f"[{self.conn_id.hex()}] Already closed (running=False)")
             return
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing target connection")
 
         # 立即取消 read_loop 任务，避免阻塞在读取上
-        if self._read_task and not self._read_task.done():
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except asyncio.CancelledError:
-                logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
-            except Exception as e:
-                logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
+        if self._read_task:
+            logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
+            if not self._read_task.done():
+                logger.info(f"[{self.conn_id.hex()}] Cancelling read task")
+                self._read_task.cancel()
+                try:
+                    await self._read_task
+                    logger.debug(f"[{self.conn_id.hex()}] Read task await completed")
+                except asyncio.CancelledError:
+                    logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
+                except Exception as e:
+                    logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
+        else:
+            logger.warning(f"[{self.conn_id.hex()}] No read task found!")
 
         if self.writer:
             try:
