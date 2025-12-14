@@ -100,28 +100,36 @@ class TargetConnection:
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing target connection")
 
-        # 立即取消 read_loop 任务，避免阻塞在读取上
-        if self._read_task:
-            logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
-            if not self._read_task.done():
-                logger.info(f"[{self.conn_id.hex()}] Cancelling read task")
-                self._read_task.cancel()
+        try:
+            # 立即取消 read_loop 任务，避免阻塞在读取上（必须先做，确保数据不再发送）
+            if self._read_task:
+                logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
+                if not self._read_task.done():
+                    logger.info(f"[{self.conn_id.hex()}] Cancelling read task")
+                    self._read_task.cancel()
+                    try:
+                        await self._read_task
+                        logger.debug(f"[{self.conn_id.hex()}] Read task await completed")
+                    except asyncio.CancelledError:
+                        logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
+                    except Exception as e:
+                        logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
+            else:
+                logger.warning(f"[{self.conn_id.hex()}] No read task found!")
+
+            # 关闭写入端
+            if self.writer:
                 try:
-                    await self._read_task
-                    logger.debug(f"[{self.conn_id.hex()}] Read task await completed")
-                except asyncio.CancelledError:
-                    logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
+                    self.writer.close()
+                    # wait_closed() 是 Python 3.7+ 才有的方法
+                    if hasattr(self.writer, 'wait_closed'):
+                        await self.writer.wait_closed()
                 except Exception as e:
-                    logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
-        else:
-            logger.warning(f"[{self.conn_id.hex()}] No read task found!")
+                    logger.debug(f"[{self.conn_id.hex()}] Writer close error: {e}")
 
-        if self.writer:
+        finally:
+            # 无论如何都要通知客户端关闭（即使前面出错）
             try:
-                self.writer.close()
-                await self.writer.wait_closed()
+                await self.ws_handler.close_connection(self.conn_id)
             except Exception as e:
-                logger.debug(f"[{self.conn_id.hex()}] Writer close error: {e}")
-
-        # 通知客户端关闭
-        await self.ws_handler.close_connection(self.conn_id)
+                logger.debug(f"[{self.conn_id.hex()}] Failed to notify client close: {e}")

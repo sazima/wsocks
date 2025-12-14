@@ -116,8 +116,13 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
     async def send_data(self, conn_id: bytes, data: bytes):
         """发送数据到客户端"""
-        packed_data = Protocol.pack(MSG_TYPE_DATA, conn_id, data, self.password)
-        await self.write_message(packed_data, binary=True)
+        try:
+            packed_data = Protocol.pack(MSG_TYPE_DATA, conn_id, data, self.password)
+            await self.write_message(packed_data, binary=True)
+        except Exception as e:
+            # WebSocket 已关闭或发送失败，记录并抛出异常让调用方处理
+            logger.debug(f"[{conn_id.hex()}] Failed to send data to client: {e}")
+            raise
 
     async def send_connect_success(self, conn_id: bytes):
         """发送连接成功响应"""
