@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import socket
 from typing import Optional
 from wsocks.common.logger import setup_logger
@@ -52,9 +53,13 @@ class TargetConnection:
             while self.running:
                 # 移除读取超时，使用更大的缓冲区提升性能
                 data = await self.reader.read(self.buffer_size)
-
+                if not self.running:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] not running break.")
+                    break
                 if not data:
-                    logger.info(f"[{self.conn_id.hex()}] Target closed")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Target closed")
                     break
 
                 # 发送回客户端
@@ -62,7 +67,8 @@ class TargetConnection:
 
         except asyncio.CancelledError:
             # 任务被取消，这是正常的关闭流程
-            logger.debug(f"[{self.conn_id.hex()}] Read loop cancelled")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Read loop cancelled")
             raise  # 重新抛出 CancelledError，确保任务正确结束
         except Exception as e:
             logger.error(f"[{self.conn_id.hex()}] Read error: {e}")
@@ -88,13 +94,15 @@ class TargetConnection:
         """关闭连接"""
         # 防止并发关闭：只允许第一个 close() 调用执行完整的清理流程
         if self._closing:
-            logger.debug(f"[{self.conn_id.hex()}] Already in closing process, skipping")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Already in closing process, skipping")
             return
 
         self._closing = True
 
         if not self.running:
-            logger.debug(f"[{self.conn_id.hex()}] Already closed (running=False)")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Already closed (running=False)")
             return
 
         self.running = False
@@ -103,33 +111,49 @@ class TargetConnection:
         try:
             # 立即取消 read_loop 任务，避免阻塞在读取上（必须先做，确保数据不再发送）
             if self._read_task:
-                logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
                 if not self._read_task.done():
                     logger.info(f"[{self.conn_id.hex()}] Cancelling read task")
                     self._read_task.cancel()
                     try:
                         await self._read_task
-                        logger.debug(f"[{self.conn_id.hex()}] Read task await completed")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Read task await completed")
                     except asyncio.CancelledError:
-                        logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Read task cancelled")
                     except Exception as e:
-                        logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
             else:
                 logger.warning(f"[{self.conn_id.hex()}] No read task found!")
 
             # 关闭写入端
             if self.writer:
+                logger.info(f"[{self.conn_id.hex()}] Closing writer")
                 try:
                     self.writer.close()
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Writer closed, waiting...")
                     # wait_closed() 是 Python 3.7+ 才有的方法
                     if hasattr(self.writer, 'wait_closed'):
                         await self.writer.wait_closed()
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Writer wait_closed completed")
                 except Exception as e:
-                    logger.debug(f"[{self.conn_id.hex()}] Writer close error: {e}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Writer close error: {e}")
+            else:
+                logger.warning(f"[{self.conn_id.hex()}] No writer to close")
 
         finally:
             # 无论如何都要通知客户端关闭（即使前面出错）
+            logger.info(f"[{self.conn_id.hex()}] Notifying client to close")
             try:
-                await self.ws_handler.close_connection(self.conn_id)
+                await self.ws_handler.close_connection(self.conn_id)  # todo: 这里是否重复了
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] Client close notification sent")
             except Exception as e:
-                logger.debug(f"[{self.conn_id.hex()}] Failed to notify client close: {e}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] Failed to notify client close: {e}")

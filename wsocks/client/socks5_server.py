@@ -1,3 +1,4 @@
+import logging
 import socket
 import struct
 import asyncio
@@ -159,10 +160,13 @@ class SOCKS5Connection:
         if notify_server:
             try:
                 # 通知服务端关闭
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] Sending close message to server")
                 await self.ws_client.send_message(MSG_TYPE_CLOSE, self.conn_id, b'')
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] Sending close message to server success")
             except Exception as e:
                 logger.debug(f"[{self.conn_id.hex()}] Failed to send close message: {e}")
-
         # 先关闭 socket 的发送端，让正在读取的操作能够正常结束
         try:
             self.client_socket.shutdown(socket.SHUT_RDWR)
@@ -708,7 +712,11 @@ class SOCKS5Server:
             raise
         finally:
             # 确保连接被正确关闭并通知服务端
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{connection.conn_id.hex()}] start close SOCKS5 connection")
             await connection.close()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{connection.conn_id.hex()}] SOCKS5 connection closed")
 
     async def _handle_udp_associate(self, connection: SOCKS5Connection, target_addr: str, target_port: int):
         """处理 UDP ASSOCIATE 请求"""

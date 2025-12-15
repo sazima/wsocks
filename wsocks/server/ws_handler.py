@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import socket
 import time
 from typing import Dict, Tuple, Optional
@@ -46,7 +47,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                 asyncio.ensure_future(self.handle_close(conn_id))
             elif msg_type == MSG_TYPE_HEARTBEAT:
                 # 心跳消息，回应确认（可选）
-                logger.debug(f"Received heartbeat ({len(data)} bytes)")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Received heartbeat ({len(data)} bytes)")
                 # 可以选择回应心跳或仅忽略
                 # asyncio.ensure_future(self.send_heartbeat_response(conn_id, data))
             elif msg_type == MSG_TYPE_UDP_DATA:
@@ -116,12 +118,25 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
     async def send_data(self, conn_id: bytes, data: bytes):
         """发送数据到客户端"""
+        # 检查连接是否还存在（避免向已关闭的连接发送数据）
+        if conn_id not in self.connections:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Connection already closed, dropping data packet ({len(data)} bytes)")
+            return
+
         try:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Sending data to client ({len(data)} bytes)")
             packed_data = Protocol.pack(MSG_TYPE_DATA, conn_id, data, self.password)
+            if conn_id not in self.connections:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{conn_id.hex()}] Connection already closed, dropping data packet ({len(data)} bytes)")
+                return
             await self.write_message(packed_data, binary=True)
         except Exception as e:
             # WebSocket 已关闭或发送失败，记录并抛出异常让调用方处理
-            logger.debug(f"[{conn_id.hex()}] Failed to send data to client: {e}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Failed to send data to client: {e}")
             raise
 
     async def send_connect_success(self, conn_id: bytes):
@@ -129,7 +144,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         try:
             packed_data = Protocol.pack(MSG_TYPE_CONNECT_SUCCESS, conn_id, b'', self.password)
             await self.write_message(packed_data, binary=True)
-            logger.debug(f"[{conn_id.hex()}] Sent connect success response")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Sent connect success response")
         except Exception as e:
             logger.error(f"[{conn_id.hex()}] Failed to send connect success: {e}")
 
@@ -138,7 +154,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         try:
             packed_data = Protocol.pack(MSG_TYPE_CONNECT_FAILED, conn_id, reason.encode(), self.password)
             await self.write_message(packed_data, binary=True)
-            logger.debug(f"[{conn_id.hex()}] Sent connect failed response: {reason}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Sent connect failed response: {reason}")
         except Exception as e:
             logger.error(f"[{conn_id.hex()}] Failed to send connect failed: {e}")
 
@@ -148,7 +165,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
             packed_data = Protocol.pack(MSG_TYPE_CLOSE, conn_id, b'', self.password)
             await self.write_message(packed_data, binary=True)
         except Exception as e:
-            logger.debug(f"[{conn_id.hex()}] Failed to send close message: {e}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{conn_id.hex()}] Failed to send close message: {e}")
 
         # 使用 pop 避免并发删除时的 KeyError
         self.connections.pop(conn_id, None)
@@ -163,7 +181,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
             dst_port = udp_packet['dst_port']
             payload = bytes.fromhex(udp_packet['data'])
 
-            logger.debug(f"[UDP-{conn_id.hex()}] -> {dst_addr}:{dst_port} ({len(payload)} bytes)")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[UDP-{conn_id.hex()}] -> {dst_addr}:{dst_port} ({len(payload)} bytes)")
 
             # 查找或创建 UDP socket
             udp_socket = await self._get_or_create_udp_socket(conn_id, dst_addr, dst_port)
@@ -211,7 +230,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                         timeout=60.0
                     )
 
-                    logger.debug(f"[UDP-{conn_id.hex()}] <- {addr} ({len(data)} bytes)")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[UDP-{conn_id.hex()}] <- {addr} ({len(data)} bytes)")
 
                     # 发送回客户端
                     udp_response = {
