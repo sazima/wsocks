@@ -30,6 +30,8 @@ class SOCKS5Connection:
         self.connect_error = None
         self.optimistic_send = optimistic_send  # 是否使用乐观发送（不等待 CONNECT_SUCCESS）
         self._connect_monitor_task = None  # 后台监听连接结果的任务
+        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_task = None  # 管道化发送任务
 
 
     async def socks5_handshake(self):
@@ -100,38 +102,75 @@ class SOCKS5Connection:
             logger.error(f"[{self.conn_id.hex()}] Failed to send SOCKS5 response: {e}")
 
     async def forward_data(self):
-        """转发数据"""
+        """转发数据（管道化：读取和发送并行）"""
+        # 启动管道化发送任务
+        self._send_task = asyncio.ensure_future(self._send_loop())
+
+        # 读取循环：从客户端读取数据，放入队列
         loop = asyncio.get_event_loop()
 
-        while self.running:
-            try:
-                # 从本地客户端读取数据（使用 64KB 缓冲区，移除超时）
-                data = await loop.sock_recv(self.client_socket, 524288)
+        try:
+            while self.running:
+                try:
+                    # 从本地客户端读取数据（使用 512KB 缓冲区）
+                    data = await loop.sock_recv(self.client_socket, 524288)
 
-                if not data:
-                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    if not data:
+                        logger.info(f"[{self.conn_id.hex()}] Client closed")
+                        break
+
+                    # 管道化：放入队列，由 _send_loop 发送
+                    await self._send_queue.put(data)
+
+                except asyncio.CancelledError:
+                    logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                    break
+                except OSError as e:
+                    # Socket 已关闭
+                    if e.errno == 9:  # Bad file descriptor
+                        logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                    else:
+                        logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+        finally:
+            # 通知发送任务停止
+            try:
+                await self._send_queue.put(None)  # None 作为结束信号
+            except:
+                pass
+
+    async def _send_loop(self):
+        """发送循环（管道化：从队列取出并发送）"""
+        try:
+            while self.running:
+                # 从队列取出数据
+                data = await self._send_queue.get()
+
+                # None 是结束信号
+                if data is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Send loop received stop signal")
                     break
 
                 # 发送到服务端
-                await self.ws_client.send_message(
-                    MSG_TYPE_DATA,
-                    self.conn_id,
-                    data
-                )
+                try:
+                    await self.ws_client.send_message(
+                        MSG_TYPE_DATA,
+                        self.conn_id,
+                        data
+                    )
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Send to server error: {e}")
+                    break
 
-            except asyncio.CancelledError:
-                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
-                break
-            except OSError as e:
-                # Socket 已关闭
-                if e.errno == 9:  # Bad file descriptor
-                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
-                else:
-                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
-            except Exception as e:
-                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
+        except asyncio.CancelledError:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Send loop cancelled")
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send loop error: {e}")
 
     async def send_to_client(self, data: bytes):
         """发送数据到本地客户端"""
@@ -197,6 +236,14 @@ class SOCKS5Connection:
             except asyncio.CancelledError:
                 pass
 
+        # 取消发送任务（如果有）
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
+
         if notify_server:
             try:
                 # 通知服务端关闭
@@ -233,6 +280,8 @@ class HTTPConnectConnection:
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
+        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_task = None  # 管道化发送任务
 
     async def handle(self):
         """处理 HTTP CONNECT 连接"""
@@ -327,37 +376,74 @@ class HTTPConnectConnection:
             logger.error(f"[{self.conn_id.hex()}] Failed to send HTTP response: {e}")
 
     async def forward_data(self):
-        """转发数据（与 SOCKS5 相同）"""
+        """转发数据（管道化：读取和发送并行）"""
+        # 启动管道化发送任务
+        self._send_task = asyncio.ensure_future(self._send_loop())
+
+        # 读取循环：从客户端读取数据，放入队列
         loop = asyncio.get_event_loop()
 
-        while self.running:
-            try:
-                # 从本地客户端读取数据（使用 512KB 缓冲区提升性能）
-                data = await loop.sock_recv(self.client_socket, 524288)
+        try:
+            while self.running:
+                try:
+                    # 从本地客户端读取数据（使用 512KB 缓冲区）
+                    data = await loop.sock_recv(self.client_socket, 524288)
 
-                if not data:
-                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    if not data:
+                        logger.info(f"[{self.conn_id.hex()}] Client closed")
+                        break
+
+                    # 管道化：放入队列，由 _send_loop 发送
+                    await self._send_queue.put(data)
+
+                except asyncio.CancelledError:
+                    logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                    break
+                except OSError as e:
+                    if e.errno == 9:  # Bad file descriptor
+                        logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                    else:
+                        logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+        finally:
+            # 通知发送任务停止
+            try:
+                await self._send_queue.put(None)
+            except:
+                pass
+
+    async def _send_loop(self):
+        """发送循环（管道化：从队列取出并发送）"""
+        try:
+            while self.running:
+                # 从队列取出数据
+                data = await self._send_queue.get()
+
+                # None 是结束信号
+                if data is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Send loop received stop signal")
                     break
 
                 # 发送到服务端
-                await self.ws_client.send_message(
-                    MSG_TYPE_DATA,
-                    self.conn_id,
-                    data
-                )
+                try:
+                    await self.ws_client.send_message(
+                        MSG_TYPE_DATA,
+                        self.conn_id,
+                        data
+                    )
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Send to server error: {e}")
+                    break
 
-            except asyncio.CancelledError:
-                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
-                break
-            except OSError as e:
-                if e.errno == 9:  # Bad file descriptor
-                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
-                else:
-                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
-            except Exception as e:
-                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
+        except asyncio.CancelledError:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Send loop cancelled")
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send loop error: {e}")
 
     async def send_to_client(self, data: bytes):
         """发送数据到本地客户端"""
@@ -387,6 +473,14 @@ class HTTPConnectConnection:
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        # 取消发送任务（如果有）
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
 
         if notify_server:
             try:
