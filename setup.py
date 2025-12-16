@@ -28,7 +28,7 @@ setuptools.setup(
     },
 
     # 依赖
-    install_requires=['tornado', 'websockets'],
+    install_requires=['tornado', 'websockets', 'xxhash>=3.0.0', 'msgpack'],
 
     # 使用 wheel 格式而不是 egg
     zip_safe=False,

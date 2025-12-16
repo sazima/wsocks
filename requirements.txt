@@ -1,2 +1,4 @@
 tornado>=6.1
 websockets
+xxhash>=3.0.0
+msgpack

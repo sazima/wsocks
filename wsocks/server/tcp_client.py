@@ -8,7 +8,7 @@ logger = setup_logger()
 
 class TargetConnection:
     """目标服务器连接"""
-    def __init__(self, conn_id: bytes, host: str, port: int, ws_handler, timeout: float = 30.0, buffer_size: int = 65536):
+    def __init__(self, conn_id: bytes, host: str, port: int, ws_handler, timeout: float = 30.0, buffer_size: int = 524288):
         self.conn_id = conn_id
         self.host = host
         self.port = port
@@ -20,6 +20,8 @@ class TargetConnection:
         self.running = False
         self._read_task: Optional[asyncio.Task] = None
         self._closing = False  # 防止并发关闭
+        self._early_data_buffer = []  # 缓存在连接建立前到达的数据（乐观发送）
+        self._connected = False  # 标记连接是否已建立
 
     async def connect(self):
         """连接到目标服务器"""
@@ -35,7 +37,20 @@ class TargetConnection:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             self.running = True
+            self._connected = True  # 标记连接已建立
             logger.info(f"[{self.conn_id.hex()}] Connected to {self.host}:{self.port}")
+
+            # 发送缓存的早期数据（乐观发送模式）
+            if self._early_data_buffer:
+                logger.info(f"[{self.conn_id.hex()}] Sending {len(self._early_data_buffer)} buffered early data packets")
+                for data in self._early_data_buffer:
+                    try:
+                        self.writer.write(data)
+                        await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                    except Exception as e:
+                        logger.error(f"[{self.conn_id.hex()}] Failed to send buffered data: {e}")
+                        raise
+                self._early_data_buffer.clear()
 
             # 开始读取数据，保存任务引用以便后续取消
             self._read_task = asyncio.ensure_future(self.read_loop())
@@ -77,6 +92,13 @@ class TargetConnection:
 
     async def send_data(self, data: bytes):
         """发送数据到目标服务器"""
+        # 如果连接还没建立，缓存数据（乐观发送模式）
+        if not self._connected:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Buffering early data ({len(data)} bytes)")
+            self._early_data_buffer.append(data)
+            return
+
         if not self.running or not self.writer:
             return
 
@@ -149,9 +171,10 @@ class TargetConnection:
 
         finally:
             # 无论如何都要通知客户端关闭（即使前面出错）
+            # close_connection 使用锁确保所有 send_data 完成后再关闭
             logger.info(f"[{self.conn_id.hex()}] Notifying client to close")
             try:
-                await self.ws_handler.close_connection(self.conn_id)  # todo: 这里是否重复了
+                await self.ws_handler.close_connection(self.conn_id)
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"[{self.conn_id.hex()}] Client close notification sent")
             except Exception as e:

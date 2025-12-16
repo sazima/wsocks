@@ -42,20 +42,24 @@ class WebSocketClient:
         self.monitor_task: Optional[asyncio.Task] = None  # 监控任务
 
     async def connect(self):
-        """连接到服务器（初始创建1个连接，后续动态扩展）"""
+        """连接到服务器（初始创建多个连接以减少冷启动延迟，后续动态扩展）"""
         self.running = True
 
-        # 初始只创建1个连接（闲置模式）
-        logger.info(f"Creating initial WebSocket connection (pool_size={self.pool_size}, dynamic scaling enabled)")
-        self.target_ws_count = 1
-        task = asyncio.ensure_future(self._connect_single(0))
-        self.ws_tasks[0] = task
+        # 初始创建 4 个连接（或 pool_size 的一半，取较小值）以减少冷启动延迟
+        initial_count = min(4, max(1, self.pool_size // 2))
+        logger.info(f"Creating {initial_count} initial WebSocket connections (pool_size={self.pool_size}, dynamic scaling enabled)")
+        self.target_ws_count = initial_count
+
+        # 创建初始连接
+        for i in range(initial_count):
+            task = asyncio.ensure_future(self._connect_single(i))
+            self.ws_tasks[i] = task
 
         # 启动监控任务（定期检查并调整连接数）
         self.monitor_task = asyncio.ensure_future(self._monitor_and_scale())
 
         # 等待初始连接启动
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)  # 稍微增加等待时间，确保连接建立
 
     async def _connect_single(self, index: int):
         """连接单个 WebSocket（带重连）"""
@@ -241,8 +245,8 @@ class WebSocketClient:
                 udp_relay = self.socks5_server.get_udp_relay()
                 if udp_relay:
                     # 解析 UDP 数据包
-                    import ast
-                    udp_packet = ast.literal_eval(data.decode())
+                    import msgpack
+                    udp_packet = msgpack.unpackb(data, raw=False)
                     dst_addr = udp_packet['dst_addr']
                     dst_port = udp_packet['dst_port']
                     payload = bytes.fromhex(udp_packet['data'])
