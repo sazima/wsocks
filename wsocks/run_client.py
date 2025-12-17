@@ -85,8 +85,9 @@ def main():
     # 设置高性能事件循环（如果可用）
     setup_event_loop()
 
-    # Python 3.6 兼容：使用 get_event_loop() 而不是 asyncio.run()
-    loop = asyncio.get_event_loop()
+    # 创建新的事件循环
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(async_main())
     except KeyboardInterrupt:
@@ -96,7 +97,7 @@ def main():
         pass
     finally:
         # 取消所有待处理的任务
-        pending = asyncio.Task.all_tasks(loop)
+        pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
         # 等待所有任务取消完成

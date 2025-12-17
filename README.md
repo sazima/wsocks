@@ -40,6 +40,11 @@
 ```bash
 pip install wsocks
 ```
+如安装过程中提示 uvloop 安装失败，可以跳过 uvloop：
+
+```bash
+pip install 'wsocks[no-uvloop]'
+```
 
 ## 使用方法
 
