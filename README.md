@@ -46,6 +46,19 @@ pip install wsocks
 pip install 'wsocks[no-uvloop]'
 ```
 
+### TLS 指纹伪装（可选）
+
+如需启用 TLS 指纹伪装以绕过高级检测，需要额外安装 `curl_cffi`（需要 Python 3.10+）：
+
+```bash
+pip install curl_cffi
+```
+
+**注意**:
+- `curl_cffi` 需要 Python 3.10 或更高版本
+- 如果不需要 TLS 指纹功能，无需安装 `curl_cffi`，使用标准的 `websockets` 库即可
+
+
 ## 使用方法
 
 ### 1. 服务端配置
@@ -85,7 +98,9 @@ wsocks_server -c config_server.json
     "ws_pool_size": 8,
     "heartbeat_enabled": true,
     "heartbeat_min": 20,
-    "heartbeat_max": 50
+    "heartbeat_max": 50,
+    "use_fingerprint": false,
+    "impersonate": "chrome124"
   },
   "local": {
     "host": "127.0.0.1",
@@ -99,7 +114,12 @@ wsocks_server -c config_server.json
 }
 ```
 
-推荐自行配置使用wss
+**TLS 指纹伪装说明**:
+- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi`）
+- `impersonate`: 指定浏览器指纹，支持 `chrome99-136`、`safari153-260`、`firefox133/135`, 详细支持列表：https://github.com/lexiforest/curl_cffi?tab=readme-ov-file#supported-impersonate-browsers
+- 如不需要此功能，保持 `use_fingerprint: false` 即可，无需安装额外依赖
+
+正式使用务必自行配置使用wss
 
 ### 4. 启动客户端
 
@@ -141,6 +161,8 @@ wsocks_client -c config_client.json
 | server.heartbeat_enabled | 启用应用层随机心跳 | true  |
 | server.heartbeat_min | 心跳最小间隔（秒） | 20    |
 | server.heartbeat_max | 心跳最大间隔（秒） | 50    |
+| server.use_fingerprint | 启用 TLS 指纹伪装 | false |
+| server.impersonate | 浏览器指纹（chrome99-136/safari153-260/firefox133,135） | chrome124 |
 | local.port | 本地代理端口（支持 SOCKS5 / HTTP） | 1080  |
 | udp.enabled | 启用 UDP 转发（SOCKS5 UDP Associate） | false |
 | udp.timeout | UDP 会话超时时间（秒） | 60    |

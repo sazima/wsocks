@@ -1,20 +1,21 @@
 import asyncio
 import logging
 
-import websockets
 import random
 import time
 import os
 from typing import List, Optional
 from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
 from wsocks.common.logger import setup_logger
+from wsocks.client.ws_adapter import create_ws_adapter, WebSocketAdapter
 
 logger = setup_logger()
 
 class WebSocketClient:
     """WebSocket 客户端（支持连接池）"""
     def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8,
-                 heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50):
+                 heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50,
+                 use_fingerprint: bool = False, impersonate: str = "chrome124"):
         self.url = url
         self.password = password
         self.socks5_server = socks5_server
@@ -22,9 +23,13 @@ class WebSocketClient:
         self.ping_timeout = ping_timeout
         self.compression = 'deflate' if compression else None
         self.pool_size = pool_size
-        self.ws_pool: List[Optional[websockets.WebSocketClientProtocol]] = [None] * pool_size
+        self.ws_pool: List[Optional[WebSocketAdapter]] = [None] * pool_size
         self.running = False
         self.next_ws_index = 0  # 轮询索引
+
+        # TLS 指纹伪装配置
+        self.use_fingerprint = use_fingerprint
+        self.impersonate = impersonate
 
         # 应用层心跳配置
         self.heartbeat_enabled = heartbeat_enabled
@@ -66,23 +71,34 @@ class WebSocketClient:
         try:
             while self.running:
                 try:
-                    logger.info(f"[WS-{index}] Connecting to {self.url}")
+                    fingerprint_info = f", fingerprint={self.impersonate}" if self.use_fingerprint else ""
+                    logger.info(f"[WS-{index}] Connecting to {self.url}{fingerprint_info}")
 
-                    # 禁用原生 ping/pong 以避免固定时序特征
-                    # 使用应用层随机心跳代替
-                    ws = await websockets.connect(
-                        self.url,
-                        ping_interval=None if self.heartbeat_enabled else self.ping_interval,
-                        ping_timeout=None if self.heartbeat_enabled else self.ping_timeout,
-                        compression=self.compression
+                    # 创建适配器
+                    adapter = create_ws_adapter(
+                        use_fingerprint=self.use_fingerprint,
+                        impersonate=self.impersonate
                     )
+
+                    # 连接参数
+                    connect_kwargs = {}
+                    if not self.use_fingerprint:
+                        # 标准 websockets 支持这些参数
+                        connect_kwargs['ping_interval'] = None if self.heartbeat_enabled else self.ping_interval
+                        connect_kwargs['ping_timeout'] = None if self.heartbeat_enabled else self.ping_timeout
+                        connect_kwargs['compression'] = self.compression
+
+                    # 连接
+                    ws = await adapter.connect(self.url, **connect_kwargs)
+
                     self.ws_pool[index] = ws
                     self.last_activity_time[index] = time.time()
                     self.last_business_activity_time[index] = 0
                     self.last_heartbeat_time[index] = 0
 
                     heartbeat_mode = "app-layer random" if self.heartbeat_enabled else f"native {self.ping_interval}s"
-                    logger.info(f"[WS-{index}] Connected (compression={self.compression}, heartbeat={heartbeat_mode})")
+                    adapter_type = "CurlCffi" if self.use_fingerprint else "WebSockets"
+                    logger.info(f"[WS-{index}] Connected (adapter={adapter_type}, compression={self.compression}, heartbeat={heartbeat_mode})")
 
                     # 启动接收和心跳任务
                     receive_task = asyncio.ensure_future(self._receive_loop(index, ws))
@@ -114,20 +130,21 @@ class WebSocketClient:
             self.ws_pool[index] = None
             raise
 
-    async def _receive_loop(self, index: int, ws: websockets.WebSocketClientProtocol):
+    async def _receive_loop(self, index: int, ws: WebSocketAdapter):
         """接收消息循环（单个连接）"""
         try:
             async for message in ws:
                 self.last_activity_time[index] = time.time()  # 更新活动时间
                 await self.handle_message(message)
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"[WS-{index}] Connection closed")
-            self.ws_pool[index] = None
         except Exception as e:
-            logger.error(f"[WS-{index}] Receive error: {e}")
+            # 兼容不同适配器的连接关闭异常
+            if "ConnectionClosed" in str(type(e).__name__) or "closed" in str(e).lower():
+                logger.warning(f"[WS-{index}] Connection closed")
+            else:
+                logger.error(f"[WS-{index}] Receive error: {e}")
             self.ws_pool[index] = None
 
-    async def _heartbeat_loop(self, index: int, ws: websockets.WebSocketClientProtocol):
+    async def _heartbeat_loop(self, index: int, ws: WebSocketAdapter):
         try:
             while self.running and self.ws_pool[index] is not None:
                 active_socks = self._get_active_socks_count()
