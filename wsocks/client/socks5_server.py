@@ -5,15 +5,22 @@ import asyncio
 import os
 import time
 import re
+import msgpack
 from typing import Dict, Optional, Tuple, Union
 from wsocks.common.logger import setup_logger
 from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_UDP_ASSOCIATE, MSG_TYPE_UDP_DATA
 
 logger = setup_logger()
 
+# 性能分析开关（可通过环境变量控制）
+ENABLE_PERF_LOG = os.getenv('WSOCKS_PERF_LOG', '0') == '1'
+
+# 乐观发送模式开关（默认启用，可通过环境变量禁用）
+ENABLE_OPTIMISTIC_SEND = os.getenv('WSOCKS_OPTIMISTIC_SEND', '1') == '1'
+
 class SOCKS5Connection:
     """SOCKS5 连接"""
-    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client):
+    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client, optimistic_send: bool = True):
         self.client_socket = client_socket
         self.conn_id = conn_id
         self.ws_client = ws_client
@@ -21,6 +28,10 @@ class SOCKS5Connection:
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
+        self.optimistic_send = optimistic_send  # 是否使用乐观发送（不等待 CONNECT_SUCCESS）
+        self._connect_monitor_task = None  # 后台监听连接结果的任务
+        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_task = None  # 管道化发送任务
 
 
     async def socks5_handshake(self):
@@ -91,38 +102,75 @@ class SOCKS5Connection:
             logger.error(f"[{self.conn_id.hex()}] Failed to send SOCKS5 response: {e}")
 
     async def forward_data(self):
-        """转发数据"""
+        """转发数据（管道化：读取和发送并行）"""
+        # 启动管道化发送任务
+        self._send_task = asyncio.ensure_future(self._send_loop())
+
+        # 读取循环：从客户端读取数据，放入队列
         loop = asyncio.get_event_loop()
 
-        while self.running:
-            try:
-                # 从本地客户端读取数据（使用 64KB 缓冲区，移除超时）
-                data = await loop.sock_recv(self.client_socket, 65536)
+        try:
+            while self.running:
+                try:
+                    # 从本地客户端读取数据（使用 512KB 缓冲区）
+                    data = await loop.sock_recv(self.client_socket, 524288)
 
-                if not data:
-                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    if not data:
+                        logger.info(f"[{self.conn_id.hex()}] Client closed")
+                        break
+
+                    # 管道化：放入队列，由 _send_loop 发送
+                    await self._send_queue.put(data)
+
+                except asyncio.CancelledError:
+                    logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                    break
+                except OSError as e:
+                    # Socket 已关闭
+                    if e.errno == 9:  # Bad file descriptor
+                        logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                    else:
+                        logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+        finally:
+            # 通知发送任务停止
+            try:
+                await self._send_queue.put(None)  # None 作为结束信号
+            except:
+                pass
+
+    async def _send_loop(self):
+        """发送循环（管道化：从队列取出并发送）"""
+        try:
+            while self.running:
+                # 从队列取出数据
+                data = await self._send_queue.get()
+
+                # None 是结束信号
+                if data is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Send loop received stop signal")
                     break
 
                 # 发送到服务端
-                await self.ws_client.send_message(
-                    MSG_TYPE_DATA,
-                    self.conn_id,
-                    data
-                )
+                try:
+                    await self.ws_client.send_message(
+                        MSG_TYPE_DATA,
+                        self.conn_id,
+                        data
+                    )
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Send to server error: {e}")
+                    break
 
-            except asyncio.CancelledError:
-                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
-                break
-            except OSError as e:
-                # Socket 已关闭
-                if e.errno == 9:  # Bad file descriptor
-                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
-                else:
-                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
-            except Exception as e:
-                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
+        except asyncio.CancelledError:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Send loop cancelled")
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send loop error: {e}")
 
     async def send_to_client(self, data: bytes):
         """发送数据到本地客户端"""
@@ -145,6 +193,29 @@ class SOCKS5Connection:
         self.connect_error = reason
         self.connect_event.set()
 
+    async def _monitor_connect_result(self, timeout: float = 30.0):
+        """后台监听连接结果（用于乐观发送模式）
+
+        如果连接失败，会关闭连接并清理资源。
+        如果超时，也会关闭连接。
+        """
+        try:
+            # 等待连接结果
+            await asyncio.wait_for(self.connect_event.wait(), timeout=timeout)
+
+            if not self.connect_success:
+                # 连接失败，需要关闭
+                error_msg = self.connect_error or "Connection failed"
+                logger.error(f"[{self.conn_id.hex()}] Optimistic send failed: {error_msg}")
+                await self.close(notify_server=False)  # 不再通知服务端，因为服务端已经知道失败了
+            else:
+                # 连接成功，记录日志
+                if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{self.conn_id.hex()}] [PERF] Optimistic send validated: connection succeeded")
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.conn_id.hex()}] Optimistic send timeout: no response from server")
+            await self.close(notify_server=True)
+
     async def close(self, notify_server: bool = True):
         """关闭连接
 
@@ -156,6 +227,22 @@ class SOCKS5Connection:
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        # 取消后台监听任务（如果有）
+        if self._connect_monitor_task and not self._connect_monitor_task.done():
+            self._connect_monitor_task.cancel()
+            try:
+                await self._connect_monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        # 取消发送任务（如果有）
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
 
         if notify_server:
             try:
@@ -193,6 +280,8 @@ class HTTPConnectConnection:
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
+        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_task = None  # 管道化发送任务
 
     async def handle(self):
         """处理 HTTP CONNECT 连接"""
@@ -210,7 +299,7 @@ class HTTPConnectConnection:
             await self.ws_client.send_message(
                 MSG_TYPE_CONNECT,
                 self.conn_id,
-                str(connect_data).encode()
+                msgpack.packb(connect_data)
             )
 
             # 等待服务端连接响应（最多30秒）
@@ -287,37 +376,74 @@ class HTTPConnectConnection:
             logger.error(f"[{self.conn_id.hex()}] Failed to send HTTP response: {e}")
 
     async def forward_data(self):
-        """转发数据（与 SOCKS5 相同）"""
+        """转发数据（管道化：读取和发送并行）"""
+        # 启动管道化发送任务
+        self._send_task = asyncio.ensure_future(self._send_loop())
+
+        # 读取循环：从客户端读取数据，放入队列
         loop = asyncio.get_event_loop()
 
-        while self.running:
-            try:
-                # 从本地客户端读取数据
-                data = await loop.sock_recv(self.client_socket, 65536)
+        try:
+            while self.running:
+                try:
+                    # 从本地客户端读取数据（使用 512KB 缓冲区）
+                    data = await loop.sock_recv(self.client_socket, 524288)
 
-                if not data:
-                    logger.info(f"[{self.conn_id.hex()}] Client closed")
+                    if not data:
+                        logger.info(f"[{self.conn_id.hex()}] Client closed")
+                        break
+
+                    # 管道化：放入队列，由 _send_loop 发送
+                    await self._send_queue.put(data)
+
+                except asyncio.CancelledError:
+                    logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
+                    break
+                except OSError as e:
+                    if e.errno == 9:  # Bad file descriptor
+                        logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
+                    else:
+                        logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
+                    break
+        finally:
+            # 通知发送任务停止
+            try:
+                await self._send_queue.put(None)
+            except:
+                pass
+
+    async def _send_loop(self):
+        """发送循环（管道化：从队列取出并发送）"""
+        try:
+            while self.running:
+                # 从队列取出数据
+                data = await self._send_queue.get()
+
+                # None 是结束信号
+                if data is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{self.conn_id.hex()}] Send loop received stop signal")
                     break
 
                 # 发送到服务端
-                await self.ws_client.send_message(
-                    MSG_TYPE_DATA,
-                    self.conn_id,
-                    data
-                )
+                try:
+                    await self.ws_client.send_message(
+                        MSG_TYPE_DATA,
+                        self.conn_id,
+                        data
+                    )
+                except Exception as e:
+                    logger.error(f"[{self.conn_id.hex()}] Send to server error: {e}")
+                    break
 
-            except asyncio.CancelledError:
-                logger.debug(f"[{self.conn_id.hex()}] Forward task cancelled")
-                break
-            except OSError as e:
-                if e.errno == 9:  # Bad file descriptor
-                    logger.debug(f"[{self.conn_id.hex()}] Socket already closed")
-                else:
-                    logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
-            except Exception as e:
-                logger.error(f"[{self.conn_id.hex()}] Forward error: {e}")
-                break
+        except asyncio.CancelledError:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{self.conn_id.hex()}] Send loop cancelled")
+        except Exception as e:
+            logger.error(f"[{self.conn_id.hex()}] Send loop error: {e}")
 
     async def send_to_client(self, data: bytes):
         """发送数据到本地客户端"""
@@ -347,6 +473,14 @@ class HTTPConnectConnection:
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        # 取消发送任务（如果有）
+        if self._send_task and not self._send_task.done():
+            self._send_task.cancel()
+            try:
+                await self._send_task
+            except asyncio.CancelledError:
+                pass
 
         if notify_server:
             try:
@@ -454,7 +588,7 @@ class UDPRelayServer:
                 await self.ws_client.send_message(
                     MSG_TYPE_UDP_DATA,
                     conn_id,
-                    str(udp_packet).encode()
+                    msgpack.packb(udp_packet)
                 )
 
             except asyncio.CancelledError:
@@ -581,7 +715,8 @@ class SOCKS5Server:
         server_socket.listen(100)
         server_socket.setblocking(False)
 
-        logger.info(f"SOCKS5 server listening on {self.host}:{self.port}")
+        optimistic_status = "enabled" if ENABLE_OPTIMISTIC_SEND else "disabled"
+        logger.info(f"SOCKS5 server listening on {self.host}:{self.port} (optimistic send: {optimistic_status})")
 
         loop = asyncio.get_event_loop()
 
@@ -599,6 +734,12 @@ class SOCKS5Server:
         """处理连接（带协议自动检测）"""
         connection = None
         try:
+            # 启用 TCP_NODELAY 以减少延迟
+            try:
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception as e:
+                logger.debug(f"[{conn_id.hex()}] Failed to set TCP_NODELAY: {e}")
+
             # 读取第一个字节以检测协议类型
             first_byte = await asyncio.get_event_loop().sock_recv(client_socket, 1)
 
@@ -613,7 +754,7 @@ class SOCKS5Server:
             if protocol_byte == 0x05:
                 # SOCKS5 协议
                 logger.debug(f"[{conn_id.hex()}] Detected SOCKS5 protocol")
-                connection = SOCKS5Connection(client_socket, conn_id, self.ws_client)
+                connection = SOCKS5Connection(client_socket, conn_id, self.ws_client, optimistic_send=ENABLE_OPTIMISTIC_SEND)
                 self.connections[conn_id] = connection
 
                 # 处理 SOCKS5 握手（第一个字节已经读取）
@@ -656,7 +797,11 @@ class SOCKS5Server:
     async def _handle_socks5_connection(self, connection: SOCKS5Connection, first_byte: bytes):
         """处理 SOCKS5 连接"""
         try:
+            # 性能分析：记录总体开始时间
+            perf_start_total = time.time() if ENABLE_PERF_LOG else 0
+
             # 继续 SOCKS5 握手（第一个字节已经读取是 0x05）
+            perf_t1 = time.time() if ENABLE_PERF_LOG else 0
             data = first_byte + await asyncio.get_event_loop().sock_recv(connection.client_socket, 1)
             version, nmethods = struct.unpack('!BB', data)
 
@@ -666,9 +811,14 @@ class SOCKS5Server:
             # 回复：无需认证
             response = struct.pack('!BB', 5, 0)
             await asyncio.get_event_loop().sock_sendall(connection.client_socket, response)
+            if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{connection.conn_id.hex()}] [PERF] SOCKS5 handshake: {(time.time()-perf_t1)*1000:.1f}ms")
 
             # 解析请求
+            perf_t2 = time.time() if ENABLE_PERF_LOG else 0
             cmd, target_addr, target_port = await connection.socks5_connect_request_parse()
+            if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[{connection.conn_id.hex()}] [PERF] Parse connect request: {(time.time()-perf_t2)*1000:.1f}ms")
 
             if cmd == 3:  # UDP ASSOCIATE
                 await self._handle_udp_associate(connection, target_addr, target_port)
@@ -677,6 +827,7 @@ class SOCKS5Server:
                 logger.info(f"[{connection.conn_id.hex()}] Connecting to {target_addr}:{target_port}")
 
                 # 发送连接请求到服务端
+                perf_t3 = time.time() if ENABLE_PERF_LOG else 0
                 connect_data = {
                     'host': target_addr,
                     'port': target_port
@@ -684,28 +835,56 @@ class SOCKS5Server:
                 await connection.ws_client.send_message(
                     MSG_TYPE_CONNECT,
                     connection.conn_id,
-                    str(connect_data).encode()
+                    msgpack.packb(connect_data)
                 )
+                if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[{connection.conn_id.hex()}] [PERF] Send CONNECT to server: {(time.time()-perf_t3)*1000:.1f}ms")
 
-                # 等待服务端连接响应（最多30秒）
-                try:
-                    await asyncio.wait_for(connection.connect_event.wait(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    logger.error(f"[{connection.conn_id.hex()}] Connect timeout (30s)")
-                    await connection.socks5_connect_response(success=False, error_msg="Connection timeout")
-                    return
-
-                # 检查连接结果
-                if connection.connect_success:
-                    # 连接成功，回复 SOCKS5 客户端
+                # 乐观发送模式：不等待服务端响应，立即回复 SOCKS5 成功
+                if connection.optimistic_send:
+                    perf_t5 = time.time() if ENABLE_PERF_LOG else 0
+                    # 立即回复 SOCKS5 客户端（乐观假设连接会成功）
                     await connection.socks5_connect_response(success=True)
-                    # 开始转发数据
+                    if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{connection.conn_id.hex()}] [PERF] Send SOCKS5 response (optimistic): {(time.time()-perf_t5)*1000:.1f}ms")
+                        logger.debug(f"[{connection.conn_id.hex()}] [PERF] *** TOTAL connection setup (optimistic): {(time.time()-perf_start_total)*1000:.1f}ms *** ⚡")
+
+                    # 启动后台任务监听实际的连接结果
+                    connection._connect_monitor_task = asyncio.ensure_future(
+                        connection._monitor_connect_result(timeout=30.0)
+                    )
+
+                    # 立即开始转发数据（不等待服务端确认）
                     await connection.forward_data()
+
                 else:
-                    # 连接失败，回复错误
-                    error_msg = connection.connect_error or "Connection failed"
-                    logger.error(f"[{connection.conn_id.hex()}] Connect failed: {error_msg}")
-                    await connection.socks5_connect_response(success=False, error_msg=error_msg)
+                    # 传统模式：等待服务端连接响应（最多30秒）
+                    perf_t4 = time.time() if ENABLE_PERF_LOG else 0
+                    try:
+                        await asyncio.wait_for(connection.connect_event.wait(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        logger.error(f"[{connection.conn_id.hex()}] Connect timeout (30s)")
+                        await connection.socks5_connect_response(success=False, error_msg="Connection timeout")
+                        return
+
+                    if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{connection.conn_id.hex()}] [PERF] Wait server response: {(time.time()-perf_t4)*1000:.1f}ms ⚡")
+
+                    # 检查连接结果
+                    if connection.connect_success:
+                        # 连接成功，回复 SOCKS5 客户端
+                        perf_t5 = time.time() if ENABLE_PERF_LOG else 0
+                        await connection.socks5_connect_response(success=True)
+                        if ENABLE_PERF_LOG and logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{connection.conn_id.hex()}] [PERF] Send SOCKS5 response: {(time.time()-perf_t5)*1000:.1f}ms")
+                            logger.debug(f"[{connection.conn_id.hex()}] [PERF] *** TOTAL connection setup: {(time.time()-perf_start_total)*1000:.1f}ms ***")
+                        # 开始转发数据
+                        await connection.forward_data()
+                    else:
+                        # 连接失败，回复错误
+                        error_msg = connection.connect_error or "Connection failed"
+                        logger.error(f"[{connection.conn_id.hex()}] Connect failed: {error_msg}")
+                        await connection.socks5_connect_response(success=False, error_msg=error_msg)
 
         except Exception as e:
             logger.error(f"[{connection.conn_id.hex()}] SOCKS5 error: {e}")

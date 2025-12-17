@@ -1,5 +1,5 @@
 import setuptools
-version = '0.0.9'
+version = '1.0.0'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()
@@ -28,7 +28,18 @@ setuptools.setup(
     },
 
     # 依赖
-    install_requires=['tornado', 'websockets'],
+    install_requires=[
+        'tornado',
+        'websockets',
+        'xxhash>=3.0.0',
+        'msgpack',
+        'uvloop>=0.17.0; sys_platform != "win32"',  # Linux/macOS 默认安装高性能事件循环
+    ],
+
+    # 可选依赖（用于特殊场景）
+    extras_require={
+        'no-uvloop': [],  # 如果不想安装 uvloop: pip install wsocks[no-uvloop]
+    },
 
     # 使用 wheel 格式而不是 egg
     zip_safe=False,

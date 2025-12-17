@@ -4,6 +4,7 @@ import tornado.ioloop
 import tornado.web
 from wsocks.server.ws_handler import WebSocketHandler
 from wsocks.common.logger import setup_logger
+from wsocks.common.event_loop import setup_event_loop
 
 logger = setup_logger()
 
@@ -31,6 +32,10 @@ def main():
     log_level = config.get('log_level', 'INFO')
     setup_logger(log_level)
     logger.info(f"Log level set to: {log_level}")
+
+    # 设置高性能事件循环（如果可用）
+    # Tornado 会自动使用 asyncio 的事件循环策略
+    setup_event_loop()
 
     logger.info("Starting SOCKS5-WS Proxy Server")
 
