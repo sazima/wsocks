@@ -2,3 +2,4 @@ tornado>=6.1
 websockets
 xxhash>=3.0.0
 msgpack
+uvloop>=0.17.0; sys_platform != "win32"  # 高性能事件循环（Linux/macOS 默认安装）

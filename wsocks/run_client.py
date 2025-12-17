@@ -4,6 +4,7 @@ import argparse
 from wsocks.client.socks5_server import SOCKS5Server
 from wsocks.client.ws_client import WebSocketClient
 from wsocks.common.logger import setup_logger
+from wsocks.common.event_loop import setup_event_loop
 
 logger = setup_logger()
 
@@ -46,7 +47,7 @@ async def async_main():
             None,  # 稍后设置
             ping_interval=config['server'].get('ping_interval', 30),
             ping_timeout=config['server'].get('ping_timeout', 10),
-            compression=config['server'].get('compression', True),
+            compression=config['server'].get('compression', False),
             pool_size=config['server'].get('ws_pool_size', 8),
             heartbeat_enabled=config['server'].get('heartbeat_enabled', True),
             heartbeat_min=config['server'].get('heartbeat_min', 20),
@@ -81,6 +82,9 @@ async def async_main():
 
 def main():
     """Entry point for console script"""
+    # 设置高性能事件循环（如果可用）
+    setup_event_loop()
+
     # Python 3.6 兼容：使用 get_event_loop() 而不是 asyncio.run()
     loop = asyncio.get_event_loop()
     try:

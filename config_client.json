@@ -4,7 +4,7 @@
     "password": "your-password-here",
     "ping_interval": 30,
     "ping_timeout": 10,
-    "compression": true,
+    "compression": false,
     "ws_pool_size": 8,
     "heartbeat_enabled": true,
     "heartbeat_min": 20,

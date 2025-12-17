@@ -1,6 +1,6 @@
 # SOCKS5/HTTP WebSocket 代理
 
-基于 WebSocket 的代理工具，支持 SOCKS5 和 HTTP CONNECT 协议，用于网络穿透和流量转发。
+基于 WebSocket 的高性能代理工具，支持 SOCKS5 和 HTTP CONNECT 协议，用于网络穿透和流量转发。
 
 ## 原理
 
@@ -14,14 +14,15 @@
 - 使用 WebSocket 连接池，提升并发性能
 - 通过密码和消息签名保证连接安全
 
+## 与v2ray性能对比
 
+同一服务器节点对比, 参考 speed_test 目录
 
 ## 安装
 
 ```bash
 pip install wsocks
 ```
-
 
 ## 使用方法
 
@@ -58,7 +59,7 @@ wsocks_server -c config_server.json
   "server": {
     "url": "ws://your-server.com:8888/ws",
     "password": "your-password-here",
-    "compression": true,
+    "compression": false,
     "ws_pool_size": 8,
     "heartbeat_enabled": true,
     "heartbeat_min": 20,
@@ -109,23 +110,21 @@ wsocks_client -c config_client.json
 
 ### 客户端参数
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| server.url | 服务端地址 | - |
-| server.password | 连接密码 | - |
-| server.compression | 启用数据压缩 | true |
-| server.ws_pool_size | WebSocket 连接池大小 | 8 |
-| server.heartbeat_enabled | 启用应用层随机心跳 | true |
-| server.heartbeat_min | 心跳最小间隔（秒） | 20 |
-| server.heartbeat_max | 心跳最大间隔（秒） | 50 |
-| local.port | 本地代理端口（支持 SOCKS5 / HTTP） | 1080 |
+| 参数 | 说明 | 默认值   |
+|------|------|-------|
+| server.url | 服务端地址 | -     |
+| server.password | 连接密码 | -     |
+| server.compression | 启用数据压缩 | false |
+| server.ws_pool_size | WebSocket 连接池大小 | 8     |
+| server.heartbeat_enabled | 启用应用层随机心跳 | true  |
+| server.heartbeat_min | 心跳最小间隔（秒） | 20    |
+| server.heartbeat_max | 心跳最大间隔（秒） | 50    |
+| local.port | 本地代理端口（支持 SOCKS5 / HTTP） | 1080  |
 | udp.enabled | 启用 UDP 转发（SOCKS5 UDP Associate） | false |
-| udp.timeout | UDP 会话超时时间（秒） | 60 |
+| udp.timeout | UDP 会话超时时间（秒） | 60    |
 
 
-## 对比
-同一服务器与v2ray对比
-![对比图](./speed_test/img.png)
+
 
 ## 常见问题
 
@@ -145,13 +144,10 @@ wsocks_client -c config_client.json
 ## 安全建议
 
 - 修改默认密码，使用强密码
-- 生产环境使用 WSS（WebSocket over TLS）
+- 务必使用 WSS（WebSocket over TLS）
 - 配置防火墙限制访问 IP
 
 ## 许可证
 
 MIT License
 
-## 注意事项
-
-本工具仅供学习和合法用途使用，请遵守当地法律法规。
