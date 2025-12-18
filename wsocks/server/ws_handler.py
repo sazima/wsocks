@@ -220,8 +220,10 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
             # 查找或创建 UDP socket
             udp_socket = await self._get_or_create_udp_socket(conn_id, dst_addr, dst_port)
 
-            # 发送数据
-            await asyncio.get_event_loop().sock_sendto(udp_socket, payload, (dst_addr, dst_port))
+            # 发送数据（使用 run_in_executor 兼容 uvloop）
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._blocking_udp_sendto, udp_socket, payload, (dst_addr, dst_port)
+            )
 
             # 更新活动时间
             if conn_id in self.udp_sessions:
@@ -230,6 +232,29 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
         except Exception as e:
             logger.error(f"[UDP-{conn_id.hex()}] Error: {e}")
+
+    def _blocking_udp_sendto(self, udp_socket, data, addr):
+        """在阻塞模式下发送 UDP 数据（用于 executor）"""
+        # 创建数据副本，避免在 executor 中使用时被修改
+        data_copy = bytes(data)
+        try:
+            return udp_socket.sendto(data_copy, addr)
+        except Exception as e:
+            logger.error(f"[UDP] sendto {addr} FAILED: {e}")  # 添加这行
+            import traceback
+            logger.error(traceback.format_exc())  # 添加这行
+            return 0
+
+    def _blocking_udp_recvfrom(self, udp_socket, bufsize):
+        """在阻塞模式下接收 UDP 数据（用于 executor）"""
+        try:
+            return udp_socket.recvfrom(bufsize)
+        except socket.timeout:
+            # socket 超时（5 秒无响应），返回空数据表示超时
+            return b'', ('', 0)
+        except Exception:
+            # 如果 socket 已关闭或其他错误，返回空数据
+            return b'', ('', 0)
 
     async def _get_or_create_udp_socket(self, conn_id: bytes, dst_addr: str, dst_port: int) -> socket.socket:
         """获取或创建 UDP socket"""
@@ -240,7 +265,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
         # 创建新的 UDP socket
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.setblocking(False)
+        # 设置 socket 超时为 5 秒，避免长时间阻塞线程池
+        udp_socket.settimeout(5.0)
 
         # 保存会话
         self.udp_sessions[conn_id] = (udp_socket, dst_addr, dst_port, time.time())
@@ -257,11 +283,22 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         try:
             while conn_id in self.udp_sessions:
                 try:
-                    # 接收数据（超时 60 秒）
-                    data, addr = await asyncio.wait_for(
-                        asyncio.get_event_loop().sock_recvfrom(udp_socket, 65535),
-                        timeout=60.0
+                    # 接收数据（socket 设置了 5 秒超时）（使用 run_in_executor 兼容 uvloop）
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[UDP-{conn_id.hex()}] start recv")
+
+                    # 直接调用 executor，不使用 asyncio.wait_for（socket 本身有超时）
+                    data, addr = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self._blocking_udp_recvfrom,
+                        udp_socket,
+                        65535
                     )
+
+                    # 检查是否收到有效数据（空数据表示超时或错误）
+                    if not data:
+                        logger.info(f"[UDP-{conn_id.hex()}] Socket timeout (no response in 5s), closing session")
+                        break
 
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(f"[UDP-{conn_id.hex()}] <- {addr} ({len(data)} bytes)")
@@ -281,10 +318,6 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                         sock, dst_a, dst_p, _ = self.udp_sessions[conn_id]
                         self.udp_sessions[conn_id] = (sock, dst_a, dst_p, time.time())
 
-                except asyncio.TimeoutError:
-                    # 超时，关闭会话
-                    logger.info(f"[UDP-{conn_id.hex()}] Session timeout")
-                    break
                 except Exception as e:
                     logger.error(f"[UDP-{conn_id.hex()}] Receive error: {e}")
                     break

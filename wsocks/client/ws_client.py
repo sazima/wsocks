@@ -4,6 +4,7 @@ import logging
 import random
 import time
 import os
+import traceback
 from typing import List, Optional
 from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
 from wsocks.common.logger import setup_logger
@@ -50,8 +51,8 @@ class WebSocketClient:
         """连接到服务器（初始创建多个连接以减少冷启动延迟，后续动态扩展）"""
         self.running = True
 
-        # 初始创建 4 个连接（或 pool_size 的一半，取较小值）以减少冷启动延迟
-        initial_count = min(4, max(1, self.pool_size // 2))
+        # 初始创建 2 个连接（或 pool_size 的一半，取较小值）以减少冷启动延迟
+        initial_count = min(2, max(1, self.pool_size // 2))
         logger.info(f"Creating {initial_count} initial WebSocket connections (pool_size={self.pool_size}, dynamic scaling enabled)")
         self.target_ws_count = initial_count
 
@@ -141,7 +142,13 @@ class WebSocketClient:
             if "ConnectionClosed" in str(type(e).__name__) or "closed" in str(e).lower():
                 logger.warning(f"[WS-{index}] Connection closed")
             else:
-                logger.error(f"[WS-{index}] Receive error: {e}")
+                logger.error(f"[WS-{index}] Receive error: {traceback.format_exc()}")
+            # 先关闭连接再清空
+            if self.ws_pool[index]:
+                try:
+                    await self.ws_pool[index].close()
+                except:
+                    pass
             self.ws_pool[index] = None
 
     async def _heartbeat_loop(self, index: int, ws: WebSocketAdapter):
@@ -281,6 +288,9 @@ class WebSocketClient:
         """发送消息（负载均衡到连接池）"""
         if not self.running:
             raise Exception("Not connected")
+        # 确保 data 是纯 bytes
+        if not isinstance(data, bytes):
+            data = bytes(data)
 
         packed_data = Protocol.pack(msg_type, conn_id, data, self.password)
 
@@ -302,6 +312,7 @@ class WebSocketClient:
                     return
                 except Exception as e:
                     logger.warning(f"[WS-{current_index}] Send failed: {e}, trying next...")
+                    print(traceback.format_exc())
                     self.ws_pool[current_index] = None
                     continue
 

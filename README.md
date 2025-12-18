@@ -46,19 +46,6 @@ pip install wsocks
 pip install 'wsocks[no-uvloop]'
 ```
 
-### TLS 指纹伪装（可选）
-
-如需启用 TLS 指纹伪装以绕过高级检测，需要额外安装 `curl_cffi`（需要 Python 3.10+）：
-
-```bash
-pip install curl_cffi
-```
-
-**注意**:
-- `curl_cffi` 需要 Python 3.10 或更高版本
-- 如果不需要 TLS 指纹功能，无需安装 `curl_cffi`，使用标准的 `websockets` 库即可
-
-
 ## 使用方法
 
 ### 1. 服务端配置
@@ -115,8 +102,8 @@ wsocks_server -c config_server.json
 ```
 
 **TLS 指纹伪装说明**:
-- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi`）
-- `impersonate`: 指定浏览器指纹，支持 `chrome99-136`、`safari153-260`、`firefox133/135`, 详细支持列表：https://github.com/lexiforest/curl_cffi?tab=readme-ov-file#supported-impersonate-browsers
+- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.13.0`， `pip install curl_cffi==0.13.0`）
+- `impersonate`: 指定浏览器指纹，支持 Chrome、Safari、Firefox、Edge, [支持的浏览器指纹列表](#支持的浏览器指纹列表)
 - 如不需要此功能，保持 `use_fingerprint: false` 即可，无需安装额外依赖
 
 正式使用务必自行配置使用wss
@@ -169,6 +156,22 @@ wsocks_client -c config_client.json
 
 
 
+## 支持的浏览器指纹列表
+
+| Browser         | Open Source                                                                                                                                                                         | Pro version                                                                |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------|
+| Chrome          | chrome99, chrome100, chrome101, chrome104, chrome107, chrome110, chrome116[1], chrome119[1], chrome120[1], chrome123[3], chrome124[3], chrome131[4], chrome133a[5][6], chrome136[6] | chrome132, chrome134, chrome135                                            |
+| Chrome Android  | chrome99_android, chrome131_android [4]                                                                                                                                             | chrome132_android, chrome133_android, chrome134_android, chrome135_android |
+| Chrome iOS      | N/A                                                                                                                                                                                 | coming soon                                                                |
+| Safari [7]      | safari153 [2], safari155 [2], safari170 [1], safari180 [4], safari184 [6], safari260 [8]                                                                                            | coming soon                                                                |
+| Safari iOS [7]  | safari172_ios[1], safari180_ios[4], safari184_ios [6], safari260_ios [8]                                                                                                            | coming soon                                                                |
+| Firefox         | firefox133[5], firefox135[7]                                                                                                                                                        | coming soon                                                                |
+| Firefox Android | N/A                                                                                                                                                                                 | firefox135_android                                                         |
+| Tor             | tor145 [7]                                                                                                                                                                          | coming soon                                                                |
+| Edge            | edge99, edge101                                                                                                                                                                     | edge133, edge135                                                           |
+| Opera           | N/A                                                                                                                                                                                 | coming soon                                                                |
+| Brave           | N/A                                                                                                                                                                                 | coming soon                                                                |
+
 
 ## 常见问题
 
@@ -183,7 +186,7 @@ wsocks_client -c config_client.json
 **连接频繁断开**
 - 调整 `ping_interval` 和 `ping_timeout`
 - 增加服务端 `timeout` 值
-- 
+-
 
 ## 安全建议
 

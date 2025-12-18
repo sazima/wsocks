@@ -2,12 +2,15 @@
 WebSocket 适配器模块
 支持标准 websockets 库和 curl_cffi (带 TLS 指纹伪装)
 """
+import asyncio
 import sys
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional, AsyncIterator
 
 logger = logging.getLogger(__name__)
+
+REQUIRED_CURL_CFFI_VERSION = '0.13.0'
 
 
 class WebSocketAdapter(ABC):
@@ -120,10 +123,12 @@ class CurlCffiAdapter(WebSocketAdapter):
                 支持: chrome99-chrome136, safari153-safari260, firefox133/135
                 或使用 'chrome' 自动使用最新版本
         """
-        self._session = None
+        self._session = None  # type: 'AsyncSession'
         self._ws = None
         self._impersonate = impersonate
         self._iterator = None
+        self.send_lock = asyncio.Lock()
+        self.recv_lock = asyncio.Lock()
 
     async def connect(self, url: str, **kwargs) -> 'CurlCffiAdapter':
         """连接到 WebSocket 服务器
@@ -137,11 +142,22 @@ class CurlCffiAdapter(WebSocketAdapter):
         except ImportError:
             raise ImportError(
                 "curl_cffi is not installed. Install it with: pip install curl_cffi\n"
-                "Note: curl_cffi requires Python 3.7+"
+                "Note: curl_cffi requires Python 3.9+"
+            )
+        try:
+            import curl_cffi as _curl_cffi
+            installed_version = getattr(_curl_cffi, "__version__", "unknown")
+        except Exception:
+            installed_version = "unknown"
+        if installed_version != REQUIRED_CURL_CFFI_VERSION:
+            raise ImportError(
+                f"Unsupported curl_cffi version: {installed_version} (required: {REQUIRED_CURL_CFFI_VERSION}).\n"
+                f"To install the required version, run:\n"
+                f"    pip install --upgrade \"curl_cffi=={REQUIRED_CURL_CFFI_VERSION}\"\n"
+                "Or install a different version and adjust your environment accordingly."
             )
 
         logger.debug(f"[CurlCffiAdapter] Connecting to {url} with impersonate={self._impersonate}")
-
         # 创建 AsyncSession 并连接
         self._session = AsyncSession(impersonate=self._impersonate)
         self._ws = await self._session.ws_connect(url)
@@ -153,7 +169,12 @@ class CurlCffiAdapter(WebSocketAdapter):
         """发送二进制数据"""
         if self._ws is None:
             raise RuntimeError("WebSocket not connected")
-        await self._ws.send_bytes(data)
+        async with self.send_lock:
+            # fix: 并发发送冲突
+            #   如果多个 send_message() 并发调用同一个 WebSocket 连接：
+            #   线程A: send 49236 字节 → 开始发送 → 超时（未完成）
+            #   线程B: send 82 字节 → curl 发现 buffer 还有 49236 字节未完成 → 错误 43
+            await self._ws.send_bytes(data)
 
     async def recv(self) -> bytes:
         """接收数据"""

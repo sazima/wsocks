@@ -8,7 +8,9 @@
     "ws_pool_size": 8,
     "heartbeat_enabled": true,
     "heartbeat_min": 20,
-    "heartbeat_max": 50
+    "heartbeat_max": 50,
+    "use_fingerprint": false,
+    "impersonate": "chrome124"
   },
   "local": {
     "host": "127.0.0.1",

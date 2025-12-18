@@ -5,6 +5,8 @@ import asyncio
 import os
 import time
 import re
+import traceback
+
 import msgpack
 from typing import Dict, Optional, Tuple, Union
 from wsocks.common.logger import setup_logger
@@ -113,10 +115,11 @@ class SOCKS5Connection:
             while self.running:
                 try:
                     # 从本地客户端读取数据（使用 512KB 缓冲区）
-                    data = await loop.sock_recv(self.client_socket, 524288)
+                    data = await asyncio.get_event_loop().sock_recv(self.client_socket, 524288)
 
                     if not data:
-                        logger.info(f"[{self.conn_id.hex()}] Client closed")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Client closed")
                         break
 
                     # 管道化：放入队列，由 _send_loop 发送
@@ -387,7 +390,7 @@ class HTTPConnectConnection:
             while self.running:
                 try:
                     # 从本地客户端读取数据（使用 512KB 缓冲区）
-                    data = await loop.sock_recv(self.client_socket, 524288)
+                    data = await asyncio.get_event_loop().sock_recv(self.client_socket, 524288)
 
                     if not data:
                         logger.info(f"[{self.conn_id.hex()}] Client closed")
@@ -516,7 +519,8 @@ class UDPRelayServer:
         # 创建 UDP socket
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.bind(('127.0.0.1', 0))  # 绑定到随机端口
-        self.udp_socket.setblocking(False)
+        # 保持阻塞模式，以便在 executor 中正常工作
+        # self.udp_socket.setblocking(False)
         self.udp_port = self.udp_socket.getsockname()[1]
 
         logger.info(f"UDP Relay server listening on 127.0.0.1:{self.udp_port}")
@@ -529,6 +533,23 @@ class UDPRelayServer:
         # 启动清理超时会话的任务
         asyncio.ensure_future(self._cleanup_sessions())
 
+    def _blocking_recvfrom(self, bufsize):
+        """在阻塞模式下接收 UDP 数据（用于 executor）"""
+        try:
+            return self.udp_socket.recvfrom(bufsize)
+        except Exception:
+            # 如果 socket 已关闭或出错，返回空数据
+            return b'', ('', 0)
+
+    def _blocking_sendto(self, data, addr):
+        """在阻塞模式下发送 UDP 数据（用于 executor）"""
+        # 创建数据副本，避免在 executor 中使用时被修改
+        data_copy = bytes(data)
+        try:
+            return self.udp_socket.sendto(data_copy, addr)
+        except Exception:
+            return 0
+
     async def _receive_loop(self):
         """接收 UDP 数据包"""
         loop = asyncio.get_event_loop()
@@ -536,7 +557,10 @@ class UDPRelayServer:
         while self.running:
             try:
                 # 接收数据包（最大 64KB）
-                data, addr = await loop.sock_recvfrom(self.udp_socket, 65535)
+                # 使用 run_in_executor 兼容 uvloop（uvloop 不支持 sock_recvfrom）
+                print('start recv')
+                data, addr = await loop.run_in_executor(None, self._blocking_recvfrom, 65535)
+                print('end recv')
 
                 # 解析 SOCKS5 UDP 头
                 # 格式: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
@@ -594,6 +618,7 @@ class UDPRelayServer:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                print(traceback.format_exc())
                 logger.error(f"[UDP] Receive error: {e}")
                 await asyncio.sleep(0.1)
 
@@ -616,12 +641,15 @@ class UDPRelayServer:
 
     async def send_to_client(self, conn_id: bytes, dst_addr: str, dst_port: int, data: bytes):
         """发送数据到客户端"""
+        logger.info(f"[UDP] send_to_client called: conn_id={conn_id.hex()}, dst={dst_addr}:{dst_port}, data_size={len(data)}")
+
         session = self.udp_sessions.get(conn_id)
         if not session:
-            logger.warning(f"[UDP] Session {conn_id.hex()} not found")
+            logger.warning(f"[UDP] Session {conn_id.hex()} not found in sessions")
             return
 
         client_addr, client_port, _ = session
+        logger.info(f"[UDP] Found session for {conn_id.hex()}: client={client_addr}:{client_port}")
 
         # 构造 SOCKS5 UDP 响应
         # RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
@@ -639,16 +667,22 @@ class UDPRelayServer:
         packet += struct.pack('!H', dst_port)
         packet += data
 
+        logger.info(f"[UDP] Constructed packet size={len(packet)} bytes, sending to {client_addr}:{client_port}")
+
         # 发送到客户端
         try:
-            await asyncio.get_event_loop().sock_sendto(
-                self.udp_socket,
+            # 使用 run_in_executor 兼容 uvloop（uvloop 不支持 sock_sendto）
+            sent_bytes = await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._blocking_sendto,
                 packet,
                 (client_addr, client_port)
             )
-            logger.debug(f"[UDP] Sent {len(data)} bytes to {client_addr}:{client_port}")
+            logger.info(f"[UDP] Successfully sent {sent_bytes} bytes (payload: {len(data)} bytes) to {client_addr}:{client_port}")
         except Exception as e:
-            logger.error(f"[UDP] Send error: {e}")
+            logger.error(f"[UDP] Send error to {client_addr}:{client_port}: {e}")
+            import traceback
+            logger.error(f"[UDP] Send error traceback: {traceback.format_exc()}")
 
     async def _cleanup_sessions(self):
         """清理超时的 UDP 会话"""
