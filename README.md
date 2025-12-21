@@ -102,7 +102,7 @@ wsocks_server -c config_server.json
 ```
 
 **TLS 指纹伪装说明**:
-- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.13.0`， `pip install curl_cffi==0.13.0`）
+- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.14.0`， `pip install curl_cffi==0.14.0`）
 - `impersonate`: 指定浏览器指纹，支持 Chrome、Safari、Firefox、Edge, [支持的浏览器指纹列表](#支持的浏览器指纹列表)
 - 如不需要此功能，保持 `use_fingerprint: false` 即可，无需安装额外依赖
 

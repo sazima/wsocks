@@ -178,7 +178,7 @@ def print_comparison(wsocks_results: Dict, v2ray_results: Dict, no_latency: bool
 
 def main():
     parser = argparse.ArgumentParser(description='代理性能对比测试')
-    parser.add_argument('--wsocks-port', type=int, default=1088, help='wsocks 端口 (默认: 1088)')
+    parser.add_argument('--wsocks-port', type=int, default=1089, help='wsocks 端口 (默认: 1089)')
     parser.add_argument('--v2ray-port', type=int, default=4086, help='v2ray 端口 (默认: 4086)')
     parser.add_argument('--latency-rounds', type=int, default=30, help='延迟测试轮数 (默认: 30)')
     parser.add_argument('--download-rounds', type=int, default=10, help='下载测试轮数 (默认: 10)')

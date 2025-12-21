@@ -122,6 +122,8 @@ class WebSocketClient:
 
                 except Exception as e:
                     logger.error(f"[WS-{index}] Connection error: {e}")
+
+                    logger.debug(f"[WS-{index}] Connection error: {traceback.format_exc()}")
                     self.ws_pool[index] = None
                     await asyncio.sleep(5)  # 重连延迟
 

@@ -8,9 +8,11 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Optional, AsyncIterator
 
-logger = logging.getLogger(__name__)
+from wsocks.common.logger import setup_logger
 
-REQUIRED_CURL_CFFI_VERSION = '0.13.0'
+logger = setup_logger()
+
+REQUIRED_CURL_CFFI_VERSION = '0.14.0'
 
 
 class WebSocketAdapter(ABC):
@@ -22,8 +24,13 @@ class WebSocketAdapter(ABC):
         pass
 
     @abstractmethod
-    async def send(self, data: bytes) -> None:
-        """发送二进制数据"""
+    async def send(self, data: bytes, priority: bool = False) -> None:
+        """发送二进制数据
+
+        Args:
+            data: 要发送的数据
+            priority: 是否高优先级（心跳/控制消息应设为 True）
+        """
         pass
 
     @abstractmethod
@@ -113,7 +120,12 @@ class WebSocketsAdapter(WebSocketAdapter):
 
 
 class CurlCffiAdapter(WebSocketAdapter):
-    """curl_cffi 适配器 (支持 TLS 指纹伪装)"""
+    """curl_cffi 适配器 (支持 TLS 指纹伪装)
+
+    使用双优先级队列：
+    - 高优先级队列：心跳、控制消息（立即发送）
+    - 普通队列：业务数据（正常排队）
+    """
 
     def __init__(self, impersonate: str = "chrome124"):
         """初始化适配器
@@ -127,8 +139,14 @@ class CurlCffiAdapter(WebSocketAdapter):
         self._ws = None
         self._impersonate = impersonate
         self._iterator = None
-        self.send_lock = asyncio.Lock()
-        self.recv_lock = asyncio.Lock()
+
+        # 双队列系统
+        self._high_priority_queue = asyncio.Queue(maxsize=256)  # 心跳/控制消息
+        self._normal_priority_queue = asyncio.Queue(maxsize=1024)  # 业务数据
+        self._write_task = None  # 发送循环任务
+        self._closed = False
+
+        self._send_lock = asyncio.Lock()  # 发送锁（保护直接发送）
 
     async def connect(self, url: str, **kwargs) -> 'CurlCffiAdapter':
         """连接到 WebSocket 服务器
@@ -162,19 +180,37 @@ class CurlCffiAdapter(WebSocketAdapter):
         self._session = AsyncSession(impersonate=self._impersonate)
         self._ws = await self._session.ws_connect(url)
 
+        # 启动优先级发送循环
+        self._write_task = asyncio.create_task(self._priority_write_loop())
+
         logger.info(f"[CurlCffiAdapter] Connected to {url} (impersonate={self._impersonate})")
         return self
 
-    async def send(self, data: bytes) -> None:
-        """发送二进制数据"""
-        if self._ws is None:
+    async def send(self, data: bytes, priority: bool = False) -> None:
+        """发送二进制数据（通过优先级队列）
+
+        Args:
+            data: 要发送的二进制数据
+            priority: True=高优先级（心跳/控制消息），False=普通优先级（业务数据）
+
+        Raises:
+            RuntimeError: WebSocket 未连接
+        """
+        if self._ws is None or self._closed:
             raise RuntimeError("WebSocket not connected")
-        async with self.send_lock:
-            # fix: 并发发送冲突
-            #   如果多个 send_message() 并发调用同一个 WebSocket 连接：
-            #   线程A: send 49236 字节 → 开始发送 → 超时（未完成）
-            #   线程B: send 82 字节 → curl 发现 buffer 还有 49236 字节未完成 → 错误 43
-            await self._ws.send_bytes(data)
+        async with self._send_lock:
+            await self._direct_send(data)
+        return
+
+        # 根据优先级选择队列
+        queue = self._high_priority_queue if priority else self._normal_priority_queue
+
+        try:
+            # 非阻塞入队（如果队列满则立即失败）
+            queue.put_nowait(data)
+        except asyncio.QueueFull:
+            # 队列满时阻塞等待
+            await queue.put(data)
 
     async def recv(self) -> bytes:
         """接收数据"""
@@ -200,8 +236,113 @@ class CurlCffiAdapter(WebSocketAdapter):
 
         raise TypeError(f"Unexpected message type: {type(message)}")
 
+    async def _priority_write_loop(self):
+        """优先级发送循环（单线程，无需锁）
+
+        策略：
+        1. 优先检查高优先级队列（非阻塞）
+        2. 如果高优先级队列为空，等待任意队列有数据
+        3. 单线程发送，天然串行，无需锁
+        """
+        try:
+            while not self._closed:
+                data = None
+
+                # 1. 优先检查高优先级队列（非阻塞）
+                try:
+                    data = self._high_priority_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                # 2. 如果高优先级队列为空，等待任意队列
+                if data is None:
+                    # 同时等待两个队列，谁先有数据用谁
+                    high_task = asyncio.create_task(self._high_priority_queue.get())
+                    normal_task = asyncio.create_task(self._normal_priority_queue.get())
+
+                    done, pending = await asyncio.wait(
+                        [high_task, normal_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    # 取消未完成的任务
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+                    # 获取完成的数据
+                    data = done.pop().result()
+
+                # 3. 发送数据（单线程，无需锁）
+                try:
+                    await self._direct_send(data)
+                except Exception as e:
+                    logger.error(f"[CurlCffiAdapter] Send error in write loop: {e}")
+                    # 发送失败，继续处理下一个
+
+        except asyncio.CancelledError:
+            logger.debug("[CurlCffiAdapter] Write loop cancelled")
+        except Exception as e:
+            logger.error(f"[CurlCffiAdapter] Write loop error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _direct_send(self, data: bytes) -> None:
+        """直接发送数据到 WebSocket（底层实现）
+
+        此方法只被 _priority_write_loop 单线程调用，无需锁
+
+        Args:
+            data: 要发送的数据
+
+        Raises:
+            Exception: 发送失败
+        """
+        from curl_cffi.const import CurlWsFlag, CurlECode
+
+        loop = self._ws.loop
+        sock_fd = self._ws._sock_fd
+        curl_ws_send = self._ws._curl.ws_send
+
+        offset = 0
+        while offset < len(data):
+            try:
+                # 直接发送（分片处理大数据）
+                chunk = data[offset:offset + 65535]  # libcurl 最大帧大小
+                n_sent = curl_ws_send(chunk, CurlWsFlag.BINARY)
+                offset += n_sent
+
+            except Exception as e:
+                # 处理 EAGAIN 错误 - socket 缓冲区满
+                if hasattr(e, 'code') and e.code == CurlECode.AGAIN:
+                    # 等待 socket 变为可写状态
+                    write_future = loop.create_future()
+                    try:
+                        loop.add_writer(sock_fd, write_future.set_result, None)
+                        await write_future
+                    finally:
+                        loop.remove_writer(sock_fd)
+                    continue  # 重试发送
+                else:
+                    # 其他错误直接抛出
+                    raise
+
     async def close(self) -> None:
         """关闭连接"""
+        self._closed = True
+
+        # 停止发送循环
+        if self._write_task is not None:
+            self._write_task.cancel()
+            try:
+                await self._write_task
+            except asyncio.CancelledError:
+                pass
+            self._write_task = None
+
         if self._ws is not None:
             try:
                 await self._ws.close()
