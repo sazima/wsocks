@@ -200,7 +200,8 @@ class WebSocketClient:
                 )
 
                 try:
-                    await ws.send(packed_data)
+                    # 心跳使用高优先级
+                    await ws.send(packed_data, priority=True, conn_id=heartbeat_conn_id)
                     self.last_heartbeat_time[index] = now
                     self.last_activity_time[index] = now
 
@@ -309,7 +310,9 @@ class WebSocketClient:
                 try:
                     self.last_activity_time[current_index] = time.time()
                     self.last_business_activity_time[current_index] = time.time()
-                    await ws.send(packed_data)
+                    # 发送消息时携带 conn_id，用于关闭连接时过滤队列
+                    priority = (msg_type == MSG_TYPE_HEARTBEAT)  # 心跳高优先级
+                    await ws.send(packed_data, priority=priority, conn_id=conn_id)
                     self.last_activity_time[current_index] = time.time()  # 更新活动时间
                     return
                 except Exception as e:

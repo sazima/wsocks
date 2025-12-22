@@ -24,14 +24,23 @@ class WebSocketAdapter(ABC):
         pass
 
     @abstractmethod
-    async def send(self, data: bytes, priority: bool = False) -> None:
+    async def send(self, data: bytes, priority: bool = False, conn_id: Optional[bytes] = None) -> None:
         """发送二进制数据
 
         Args:
             data: 要发送的数据
             priority: 是否高优先级（心跳/控制消息应设为 True）
+            conn_id: 连接ID（可选，用于关闭时过滤队列中的消息）
         """
         pass
+
+    async def mark_connection_closed(self, conn_id: bytes) -> None:
+        """标记连接已关闭，队列中该连接的消息将被丢弃
+
+        Args:
+            conn_id: 要标记为关闭的连接ID
+        """
+        pass  # 默认实现为空，子类可选择性实现
 
     @abstractmethod
     async def recv(self) -> bytes:
@@ -87,8 +96,14 @@ class WebSocketsAdapter(WebSocketAdapter):
         logger.info(f"[WebSocketsAdapter] Connected to {url}")
         return self
 
-    async def send(self, data: bytes) -> None:
-        """发送二进制数据"""
+    async def send(self, data: bytes, priority: bool = False, conn_id: Optional[bytes] = None) -> None:
+        """发送二进制数据
+
+        Args:
+            data: 要发送的数据
+            priority: 忽略（websockets 库不支持优先级）
+            conn_id: 忽略（websockets 库直接发送，不需要队列过滤）
+        """
         if self._ws is None:
             raise RuntimeError("WebSocket not connected")
         await self._ws.send(data)
@@ -140,13 +155,16 @@ class CurlCffiAdapter(WebSocketAdapter):
         self._impersonate = impersonate
         self._iterator = None
 
-        # 双队列系统
-        self._high_priority_queue = asyncio.Queue(maxsize=256)  # 心跳/控制消息
-        self._normal_priority_queue = asyncio.Queue(maxsize=1024)  # 业务数据
+        # 双队列系统（存储格式：(data: bytes, conn_id: Optional[bytes])）
+        self._high_priority_queue = asyncio.Queue(maxsize=512)  # 心跳/控制消息
+        self._normal_priority_queue = asyncio.Queue(maxsize=4096)  # 业务数据（增大以支持高吞吐量上传）
         self._write_task = None  # 发送循环任务
         self._closed = False
+        self._batch_send_size = 32  # 批量发送大小（调大以提升上传性能）
 
-        self._send_lock = asyncio.Lock()  # 发送锁（保护直接发送）
+        # 已关闭连接的跟踪（用于过滤队列中的消息）
+        self._closed_conn_ids = set()  # type: set[bytes]
+        self._closed_conn_lock = asyncio.Lock()
 
     async def connect(self, url: str, **kwargs) -> 'CurlCffiAdapter':
         """连接到 WebSocket 服务器
@@ -186,31 +204,46 @@ class CurlCffiAdapter(WebSocketAdapter):
         logger.info(f"[CurlCffiAdapter] Connected to {url} (impersonate={self._impersonate})")
         return self
 
-    async def send(self, data: bytes, priority: bool = False) -> None:
+    async def send(self, data: bytes, priority: bool = False, conn_id: Optional[bytes] = None) -> None:
         """发送二进制数据（通过优先级队列）
 
         Args:
             data: 要发送的二进制数据
             priority: True=高优先级（心跳/控制消息），False=普通优先级（业务数据）
+            conn_id: 连接ID（可选），用于关闭连接时过滤队列中的消息
 
         Raises:
             RuntimeError: WebSocket 未连接
         """
         if self._ws is None or self._closed:
             raise RuntimeError("WebSocket not connected")
-        async with self._send_lock:
-            await self._direct_send(data)
-        return
+
+        # 发送前检查该连接是否已关闭
+        if conn_id:
+            async with self._closed_conn_lock:
+                if conn_id in self._closed_conn_ids:
+                    logger.debug(f"[WS] Skip sending for closed connection {conn_id.hex()}")
+                    return  # 不发送
 
         # 根据优先级选择队列
         queue = self._high_priority_queue if priority else self._normal_priority_queue
 
         try:
             # 非阻塞入队（如果队列满则立即失败）
-            queue.put_nowait(data)
+            queue.put_nowait((data, conn_id))
         except asyncio.QueueFull:
             # 队列满时阻塞等待
-            await queue.put(data)
+            await queue.put((data, conn_id))
+
+    async def mark_connection_closed(self, conn_id: bytes) -> None:
+        """标记连接已关闭，队列中该连接的消息将被丢弃
+
+        Args:
+            conn_id: 要标记为关闭的连接ID
+        """
+        async with self._closed_conn_lock:
+            self._closed_conn_ids.add(conn_id)
+            logger.debug(f"[WS] Marked connection {conn_id.hex()} as closed, queued messages will be filtered")
 
     async def recv(self) -> bytes:
         """接收数据"""
@@ -241,47 +274,56 @@ class CurlCffiAdapter(WebSocketAdapter):
 
         策略：
         1. 优先检查高优先级队列（非阻塞）
-        2. 如果高优先级队列为空，等待任意队列有数据
-        3. 单线程发送，天然串行，无需锁
+        2. 批量获取多个消息以提升发送效率
+        3. 发送前过滤已关闭连接的消息
+        4. 单线程发送，天然串行，无需锁
         """
         try:
             while not self._closed:
-                data = None
+                batch = []
 
-                # 1. 优先检查高优先级队列（非阻塞）
-                try:
-                    data = self._high_priority_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+                # 1. 优先从高优先级队列批量获取
+                while len(batch) < self._batch_send_size:
+                    try:
+                        item = self._high_priority_queue.get_nowait()
+                        batch.append(item)
+                    except asyncio.QueueEmpty:
+                        break
 
-                # 2. 如果高优先级队列为空，等待任意队列
-                if data is None:
-                    # 同时等待两个队列，谁先有数据用谁
-                    high_task = asyncio.create_task(self._high_priority_queue.get())
-                    normal_task = asyncio.create_task(self._normal_priority_queue.get())
+                # 2. 如果高优先级队列为空，从普通队列批量获取
+                if not batch:
+                    # 至少等待一个消息
+                    try:
+                        item = await self._normal_priority_queue.get()
+                        batch.append(item)
+                    except asyncio.CancelledError:
+                        break
 
-                    done, pending = await asyncio.wait(
-                        [high_task, normal_task],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-
-                    # 取消未完成的任务
-                    for task in pending:
-                        task.cancel()
+                    # 批量获取剩余消息（非阻塞）
+                    while len(batch) < self._batch_send_size:
                         try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                            item = self._normal_priority_queue.get_nowait()
+                            batch.append(item)
+                        except asyncio.QueueEmpty:
+                            break
 
-                    # 获取完成的数据
-                    data = done.pop().result()
+                # 3. 批量发送
+                for item in batch:
+                    data, conn_id = item
 
-                # 3. 发送数据（单线程，无需锁）
-                try:
-                    await self._direct_send(data)
-                except Exception as e:
-                    logger.error(f"[CurlCffiAdapter] Send error in write loop: {e}")
-                    # 发送失败，继续处理下一个
+                    # 检查连接是否已关闭
+                    if conn_id:
+                        async with self._closed_conn_lock:
+                            if conn_id in self._closed_conn_ids:
+                                logger.debug(f"[WS] Discard queued message for closed connection {conn_id.hex()}")
+                                continue  # 跳过，不发送
+
+                    # 发送数据
+                    try:
+                        await self._direct_send(data)
+                    except Exception as e:
+                        logger.error(f"[CurlCffiAdapter] Send error in write loop: {e}")
+                        # 发送失败，继续处理下一个
 
         except asyncio.CancelledError:
             logger.debug("[CurlCffiAdapter] Write loop cancelled")

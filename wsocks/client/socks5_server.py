@@ -32,7 +32,7 @@ class SOCKS5Connection:
         self.connect_error = None
         self.optimistic_send = optimistic_send  # 是否使用乐观发送（不等待 CONNECT_SUCCESS）
         self._connect_monitor_task = None  # 后台监听连接结果的任务
-        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_queue = asyncio.Queue(maxsize=512)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
 
 
@@ -231,6 +231,14 @@ class SOCKS5Connection:
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
 
+        # 标记连接已关闭，队列中的消息将被过滤掉
+        for ws in self.ws_client.ws_pool:
+            if ws is not None:
+                try:
+                    await ws.mark_connection_closed(self.conn_id)
+                except Exception:
+                    pass  # 忽略错误，可能是 websockets 库不支持
+
         # 取消后台监听任务（如果有）
         if self._connect_monitor_task and not self._connect_monitor_task.done():
             self._connect_monitor_task.cancel()
@@ -283,7 +291,7 @@ class HTTPConnectConnection:
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
-        self._send_queue = asyncio.Queue(maxsize=8)  # 管道化发送队列
+        self._send_queue = asyncio.Queue(maxsize=512)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
 
     async def handle(self):
@@ -476,6 +484,14 @@ class HTTPConnectConnection:
 
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
+
+        # 标记连接已关闭，队列中的消息将被过滤掉
+        for ws in self.ws_client.ws_pool:
+            if ws is not None:
+                try:
+                    await ws.mark_connection_closed(self.conn_id)
+                except Exception:
+                    pass  # 忽略错误，可能是 websockets 库不支持
 
         # 取消发送任务（如果有）
         if self._send_task and not self._send_task.done():
