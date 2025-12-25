@@ -460,8 +460,9 @@ def create_ws_adapter(
         # 检查 curl_cffi 是否可用
         try:
             import curl_cffi
-            logger.info(f"Using CurlCffiAdapter with impersonate={impersonate}")
-            return CurlCffiAdapter(impersonate=impersonate)
+            from .ws_adapter_threaded import ThreadedCurlWebSocket
+            logger.info(f"Using ThreadedCurlWebSocket with impersonate={impersonate}")
+            return ThreadedCurlWebSocket(impersonate=impersonate)
         except ImportError:
             raise ImportError(
                 "curl_cffi is not installed. Install it with: pip install curl_cffi\n"
@@ -485,8 +486,9 @@ def auto_detect_adapter(prefer_fingerprint: bool = False) -> WebSocketAdapter:
     if prefer_fingerprint and sys.version_info >= (3, 7):
         try:
             import curl_cffi
-            logger.info("Auto-detected: Using CurlCffiAdapter (TLS fingerprinting enabled)")
-            return CurlCffiAdapter()
+            from .ws_adapter_threaded import ThreadedCurlWebSocket
+            logger.info("Auto-detected: Using ThreadedCurlWebSocket (TLS fingerprinting enabled)")
+            return ThreadedCurlWebSocket()
         except ImportError:
             logger.info("curl_cffi not available, falling back to WebSocketsAdapter")
             return WebSocketsAdapter()
