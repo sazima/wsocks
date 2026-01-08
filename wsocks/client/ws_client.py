@@ -7,6 +7,7 @@ import os
 import traceback
 from typing import List, Optional
 from wsocks.common.protocol import Protocol, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
+from wsocks.common.crypto import CryptoManager
 from wsocks.common.logger import setup_logger
 from wsocks.client.ws_adapter import create_ws_adapter, WebSocketAdapter
 
@@ -16,7 +17,7 @@ class WebSocketClient:
     """WebSocket 客户端（支持连接池）"""
     def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8,
                  heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50,
-                 use_fingerprint: bool = False, impersonate: str = "chrome124"):
+                 use_fingerprint: bool = False, impersonate: str = "chrome124", crypto_method: Optional[str] = None):
         self.url = url
         self.password = password
         self.socks5_server = socks5_server
@@ -27,6 +28,10 @@ class WebSocketClient:
         self.ws_pool: List[Optional[WebSocketAdapter]] = [None] * pool_size
         self.running = False
         self.next_ws_index = 0  # 轮询索引
+
+        # 加密管理器
+        crypto_enabled = bool(crypto_method)  # 如果指定了加密方法，则启用加密
+        self.crypto_manager = CryptoManager(password, enabled=crypto_enabled, crypto_method=crypto_method)
 
         # TLS 指纹伪装配置
         self.use_fingerprint = use_fingerprint
@@ -196,7 +201,8 @@ class WebSocketClient:
                     MSG_TYPE_HEARTBEAT,
                     heartbeat_conn_id,
                     heartbeat_data,
-                    self.password
+                    self.password,
+                    self.crypto_manager
                 )
 
                 try:
@@ -222,7 +228,7 @@ class WebSocketClient:
     async def handle_message(self, raw_data: bytes):
         """处理接收到的消息"""
         try:
-            msg = Protocol.unpack(raw_data, self.password)
+            msg = Protocol.unpack(raw_data, self.password, self.crypto_manager)
             msg_type = msg['type']
             conn_id = msg['conn_id']
             data = msg['data']
@@ -295,7 +301,7 @@ class WebSocketClient:
         if not isinstance(data, bytes):
             data = bytes(data)
 
-        packed_data = Protocol.pack(msg_type, conn_id, data, self.password)
+        packed_data = Protocol.pack(msg_type, conn_id, data, self.password, self.crypto_manager)
 
         # 负载均衡策略：基于 conn_id 哈希，确保同一连接的消息通过同一个 WebSocket
         # 这样可以保持消息顺序

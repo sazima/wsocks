@@ -11,7 +11,7 @@ def setup_logger(level: str = "INFO"):
         handler = logging.StreamHandler(sys.stdout)
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - '
-            '%(pathname)s:%(lineno)d - %(message)s'
+            '%(filename)s:%(lineno)d - %(message)s'
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)

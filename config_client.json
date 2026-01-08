@@ -1,20 +1,21 @@
 {
   "server": {
-    "url": "wss://download.example.com/go_flare",
+    "url": "ws://127.0.0.1:8888/ws",
     "password": "your-password-here",
     "ping_interval": 30,
     "ping_timeout": 10,
-    "compression": false,
+    "compression": true,
     "ws_pool_size": 8,
     "heartbeat_enabled": true,
     "heartbeat_min": 20,
     "heartbeat_max": 50,
     "use_fingerprint": false,
-    "impersonate": "chrome124"
+    "impersonate": "chrome124",
+    "crypto_method": "chacha20"
   },
   "local": {
     "host": "127.0.0.1",
-    "port": 1088
+    "port": 28888
   },
   "udp": {
     "enabled": false,

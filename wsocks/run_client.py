@@ -1,6 +1,7 @@
 import asyncio
 import json
 import argparse
+import time
 from wsocks.client.socks5_server import SOCKS5Server
 from wsocks.client.ws_client import WebSocketClient
 from wsocks.common.logger import setup_logger
@@ -41,6 +42,7 @@ async def async_main():
 
     try:
         # 创建 WebSocket 客户端
+        crypto_method = config['server'].get('crypto_method', None)
         ws_client = WebSocketClient(
             config['server']['url'],
             config['server']['password'],
@@ -53,8 +55,13 @@ async def async_main():
             heartbeat_min=config['server'].get('heartbeat_min', 20),
             heartbeat_max=config['server'].get('heartbeat_max', 50),
             use_fingerprint=config['server'].get('use_fingerprint', False),
-            impersonate=config['server'].get('impersonate', 'chrome124')
+            impersonate=config['server'].get('impersonate', 'chrome124'),
+            crypto_method=crypto_method
         )
+        if not crypto_method and config['server']['url'].startswith('ws://'):
+            for _ in range(3):
+                time.sleep(.5)
+                logger.warning('crypto_method is not set, but the url is ws://, this is not recommended !!!')
 
         # 创建 SOCKS5 服务器
         udp_config = config.get('udp', {})

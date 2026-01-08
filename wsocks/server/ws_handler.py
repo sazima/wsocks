@@ -6,6 +6,7 @@ import os
 from typing import Dict, Tuple, Optional
 import tornado.websocket
 from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_CONNECT_SUCCESS, MSG_TYPE_CONNECT_FAILED, MSG_TYPE_HEARTBEAT, MSG_TYPE_UDP_DATA
+from wsocks.common.crypto import CryptoManager
 from wsocks.common.logger import setup_logger
 from wsocks.server.tcp_client import TargetConnection
 
@@ -27,6 +28,18 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
         # 连接级别的发送锁，防止 send_data 和 close_connection 之间的竞态条件
         self.conn_send_locks: Dict[bytes, asyncio.Lock] = {}
+        
+        # 加密管理器（服务端总是创建，用于兼容加密客户端）
+        self.crypto_manager = CryptoManager(password, enabled=True)
+        
+        # 客户端加密方法（从协议字段读取，首次消息后记录）
+        self.client_crypto_method: Optional[int] = None
+        
+        # 加密管理器（服务端总是创建，用于兼容加密客户端）
+        self.crypto_manager = CryptoManager(password, enabled=True)
+        
+        # 客户端加密方法（从协议字段读取，首次消息后记录）
+        self.client_crypto_method: Optional[int] = None
 
     def check_origin(self, origin):
         return True
@@ -37,7 +50,15 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
     async def on_message(self, raw_data: bytes):
         """处理消息"""
         try:
-            msg = Protocol.unpack(raw_data, self.password)
+            # 解包消息（根据协议字段自动处理加密）
+            msg = Protocol.unpack(raw_data, self.password, self.crypto_manager)
+            
+            # 首次记录客户端加密方法（后续响应使用相同方法）
+            if self.client_crypto_method is None:
+                self.client_crypto_method = msg.get('crypto_method', 0)
+                crypto_name = "ChaCha20-Poly1305" if self.client_crypto_method == 1 else "None"
+                logger.info(f"Client crypto method: {crypto_name}")
+            
             msg_type = msg['type']
             conn_id = msg['conn_id']
             data = msg['data']
@@ -155,7 +176,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
             try:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"[{conn_id.hex()}] Sending data to client ({len(data)} bytes)")
-                packed_data = Protocol.pack(MSG_TYPE_DATA, conn_id, data, self.password)
+                crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+                packed_data = Protocol.pack(MSG_TYPE_DATA, conn_id, data, self.password, crypto_manager)
                 await self.write_message(packed_data, binary=True)
             except Exception as e:
                 # WebSocket 已关闭或发送失败，记录并抛出异常让调用方处理
@@ -166,7 +188,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
     async def send_connect_success(self, conn_id: bytes):
         """发送连接成功响应"""
         try:
-            packed_data = Protocol.pack(MSG_TYPE_CONNECT_SUCCESS, conn_id, b'', self.password)
+            crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+            packed_data = Protocol.pack(MSG_TYPE_CONNECT_SUCCESS, conn_id, b'', self.password, crypto_manager)
             await self.write_message(packed_data, binary=True)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[{conn_id.hex()}] Sent connect success response")
@@ -176,7 +199,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
     async def send_connect_failed(self, conn_id: bytes, reason: str = ""):
         """发送连接失败响应"""
         try:
-            packed_data = Protocol.pack(MSG_TYPE_CONNECT_FAILED, conn_id, reason.encode(), self.password)
+            crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+            packed_data = Protocol.pack(MSG_TYPE_CONNECT_FAILED, conn_id, reason.encode(), self.password, crypto_manager)
             await self.write_message(packed_data, binary=True)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"[{conn_id.hex()}] Sent connect failed response: {reason}")
@@ -192,7 +216,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
         # 使用锁确保所有 send_data 都完成后再关闭
         async with self.conn_send_locks[conn_id]:
             try:
-                packed_data = Protocol.pack(MSG_TYPE_CLOSE, conn_id, b'', self.password)
+                crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+                packed_data = Protocol.pack(MSG_TYPE_CLOSE, conn_id, b'', self.password, crypto_manager)
                 await self.write_message(packed_data, binary=True)
             except Exception as e:
                 if logger.isEnabledFor(logging.DEBUG):
@@ -310,7 +335,8 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                         'dst_port': addr[1],
                         'data': data.hex()
                     }
-                    packed_data = Protocol.pack(MSG_TYPE_UDP_DATA, conn_id, msgpack.packb(udp_response), self.password)
+                    crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+                    packed_data = Protocol.pack(MSG_TYPE_UDP_DATA, conn_id, msgpack.packb(udp_response), self.password, crypto_manager)
                     await self.write_message(packed_data, binary=True)
 
                     # 更新活动时间
