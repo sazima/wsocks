@@ -156,6 +156,156 @@ wsocks_client -c config_client.json
 
 
 
+## 分流规则配置
+
+在 `config_client.json` 中添加 `routing` 字段即可启用分流。未配置时所有流量走代理（与旧版行为一致）。
+
+### 基本结构
+
+```json
+"routing": {
+  "default": "proxy",
+  "rules": [...]
+}
+```
+
+| 字段 | 说明 | 可选值 |
+|------|------|--------|
+| `default` | 未命中任何规则时的默认动作 | `proxy` / `direct` / `block` |
+| `rules` | 规则列表，按顺序匹配，首次命中即返回 | — |
+
+### 规则类型
+
+#### `domain_suffix` — 域名后缀匹配
+
+匹配域名本身及所有子域名，如 `.cn` 同时匹配 `example.cn` 和 `sub.example.cn`。
+
+```json
+{
+  "type": "domain_suffix",
+  "value": [".cn", ".com.cn", ".edu.cn", ".gov.cn"],
+  "action": "direct"
+}
+```
+
+#### `domain` — 精确域名匹配
+
+```json
+{
+  "type": "domain",
+  "value": ["www.google.com", "api.github.com"],
+  "action": "proxy"
+}
+```
+
+#### `domain_keyword` — 域名关键词匹配
+
+域名中包含关键词即命中。
+
+```json
+{
+  "type": "domain_keyword",
+  "value": ["baidu", "taobao", "alibaba"],
+  "action": "direct"
+}
+```
+
+#### `ip_cidr` — IP 段匹配
+
+```json
+{
+  "type": "ip_cidr",
+  "value": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+  "action": "direct"
+}
+```
+
+#### `ruleset` — 从文件加载规则
+
+适合加载较大的规则集（如国内域名列表）。`path` 为规则文件路径（相对于工作目录或绝对路径）。
+
+```json
+{
+  "type": "ruleset",
+  "path": "direct.lst",
+  "action": "direct"
+}
+```
+
+规则文件支持两种格式，可混用：
+
+```
+# 注释以 # 开头
+
+# 格式一：纯域名（视为 domain_suffix，匹配本身及子域名）
+baidu.com
+qq.com
+taobao.com
+
+# 格式二：Surge / Clash 风格
+DOMAIN-SUFFIX,weibo.com
+DOMAIN,www.jd.com
+DOMAIN-KEYWORD,alipay
+```
+
+### 动作说明
+
+| 动作 | 说明 |
+|------|------|
+| `proxy` | 通过 WebSocket 代理转发 |
+| `direct` | 直接连接目标，不经过代理 |
+| `block` | 拒绝连接 |
+
+### 典型配置示例
+
+#### 国内直连，境外走代理
+
+```json
+"routing": {
+  "default": "proxy",
+  "rules": [
+    {
+      "type": "ip_cidr",
+      "value": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+      "action": "direct"
+    },
+    {
+      "type": "domain_suffix",
+      "value": [".cn", ".com.cn", ".edu.cn", ".gov.cn", ".net.cn", ".org.cn"],
+      "action": "direct"
+    },
+    {
+      "type": "ruleset",
+      "path": "direct.lst",
+      "action": "direct"
+    }
+  ]
+}
+```
+
+#### 仅代理被墙域名，其余直连（黑名单模式）
+
+```json
+"routing": {
+  "default": "direct",
+  "rules": [
+    {
+      "type": "ruleset",
+      "path": "proxy.lst",
+      "action": "proxy"
+    }
+  ]
+}
+```
+
+> **说明**：`proxy.lst` 可由 GUI 工具将 GFWList 预处理后生成，wsocks-core 只读取标准格式文件。
+
+### 规则匹配优先级
+
+1. 规则按 **声明顺序** 依次匹配，首次命中即返回，后续规则不再检查
+2. IP 地址请求优先走 `ip_cidr` 规则，域名请求走其余规则
+3. 未命中任何规则时使用 `default` 动作
+
 ## 支持的浏览器指纹列表
 
 | Browser         | Open Source                                                                                                                                                                         | Pro version                                                                |

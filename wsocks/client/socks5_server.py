@@ -11,6 +11,7 @@ import msgpack
 from typing import Dict, Optional, Tuple, Union
 from wsocks.common.logger import setup_logger
 from wsocks.common.protocol import Protocol, MSG_TYPE_CONNECT, MSG_TYPE_DATA, MSG_TYPE_CLOSE, MSG_TYPE_UDP_ASSOCIATE, MSG_TYPE_UDP_DATA
+from wsocks.client.router import Action
 
 logger = setup_logger()
 
@@ -19,6 +20,82 @@ ENABLE_PERF_LOG = os.getenv('WSOCKS_PERF_LOG', '0') == '1'
 
 # 乐观发送模式开关（默认启用，可通过环境变量禁用）
 ENABLE_OPTIMISTIC_SEND = os.getenv('WSOCKS_OPTIMISTIC_SEND', '1') == '1'
+
+async def _handle_direct_connect(
+    conn_id: bytes,
+    client_socket: socket.socket,
+    target_addr: str,
+    target_port: int,
+    respond,  # coroutine: respond(success: bool)
+) -> None:
+    """直连模式：建立到目标的 TCP 连接并双向转发，不经过 WS 代理。
+
+    Args:
+        conn_id:       连接 ID，仅用于日志
+        client_socket: 本地客户端 socket
+        target_addr:   目标地址
+        target_port:   目标端口
+        respond:       握手响应回调，签名为 coroutine(success: bool)
+    """
+    loop = asyncio.get_event_loop()
+    conn_id_hex = conn_id.hex()
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(target_addr, target_port),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[{conn_id_hex}] Direct connection timeout: {target_addr}:{target_port}")
+        await respond(success=False)
+        return
+    except Exception as e:
+        logger.error(f"[{conn_id_hex}] Direct connection failed to {target_addr}:{target_port}: {e}")
+        await respond(success=False)
+        return
+
+    target_sock = writer.transport.get_extra_info('socket')
+    if target_sock:
+        try:
+            target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+    await respond(success=True)
+    logger.info(f"[{conn_id_hex}] Direct forwarding {target_addr}:{target_port}")
+
+    async def client_to_target() -> None:
+        try:
+            while True:
+                data = await loop.sock_recv(client_socket, 524288)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def target_to_client() -> None:
+        try:
+            while True:
+                data = await reader.read(524288)
+                if not data:
+                    break
+                await loop.sock_sendall(client_socket, data)
+        except Exception:
+            pass
+
+    await asyncio.gather(client_to_target(), target_to_client(), return_exceptions=True)
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
 
 class SOCKS5Connection:
     """SOCKS5 连接"""
@@ -34,6 +111,7 @@ class SOCKS5Connection:
         self._connect_monitor_task = None  # 后台监听连接结果的任务
         self._send_queue = asyncio.Queue(maxsize=4096)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
+        self.direct = False  # 直连模式标志（不经过 WS 代理，close() 时无需通知服务端）
 
 
     async def socks5_handshake(self):
@@ -231,13 +309,14 @@ class SOCKS5Connection:
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
 
-        # 标记连接已关闭，队列中的消息将被过滤掉
-        for ws in self.ws_client.ws_pool:
-            if ws is not None:
-                try:
-                    await ws.mark_connection_closed(self.conn_id)
-                except Exception:
-                    pass  # 忽略错误，可能是 websockets 库不支持
+        # 直连模式下无需操作 WS 连接池（从未注册过此 conn_id）
+        if not self.direct:
+            for ws in self.ws_client.ws_pool:
+                if ws is not None:
+                    try:
+                        await ws.mark_connection_closed(self.conn_id)
+                    except Exception:
+                        pass  # 忽略错误，可能是 websockets 库不支持
 
         # 取消后台监听任务（如果有）
         if self._connect_monitor_task and not self._connect_monitor_task.done():
@@ -255,7 +334,7 @@ class SOCKS5Connection:
             except asyncio.CancelledError:
                 pass
 
-        if notify_server:
+        if notify_server and not self.direct:
             try:
                 # 通知服务端关闭
                 if logger.isEnabledFor(logging.DEBUG):
@@ -282,17 +361,19 @@ class SOCKS5Connection:
 
 class HTTPConnectConnection:
     """HTTP CONNECT 连接"""
-    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client, first_byte: bytes):
+    def __init__(self, client_socket: socket.socket, conn_id: bytes, ws_client, first_byte: bytes, router=None):
         self.client_socket = client_socket
         self.conn_id = conn_id
         self.ws_client = ws_client
         self.first_byte = first_byte  # 已读取的第一个字节
+        self.router = router
         self.running = True
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
         self._send_queue = asyncio.Queue(maxsize=4096)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
+        self.direct = False  # 直连模式标志
 
     async def handle(self):
         """处理 HTTP CONNECT 连接"""
@@ -301,6 +382,20 @@ class HTTPConnectConnection:
             target_addr, target_port = await self.parse_connect_request()
 
             logger.info(f"[{self.conn_id.hex()}] HTTP CONNECT to {target_addr}:{target_port}")
+
+            # 路由决策
+            if self.router is not None:
+                action = self.router.decide(target_addr)
+                if action == Action.BLOCK:
+                    logger.info(f"[{self.conn_id.hex()}] Blocked: {target_addr}:{target_port}")
+                    await self.send_connect_response(success=False)
+                    return
+                if action == Action.DIRECT:
+                    logger.info(f"[{self.conn_id.hex()}] Direct: {target_addr}:{target_port}")
+                    self.direct = True
+                    await _handle_direct_connect(self.conn_id, self.client_socket, target_addr, target_port,
+                                                 self.send_connect_response)
+                    return
 
             # 发送连接请求到服务端
             connect_data = {
@@ -485,13 +580,14 @@ class HTTPConnectConnection:
         self.running = False
         logger.info(f"[{self.conn_id.hex()}] Closing connection")
 
-        # 标记连接已关闭，队列中的消息将被过滤掉
-        for ws in self.ws_client.ws_pool:
-            if ws is not None:
-                try:
-                    await ws.mark_connection_closed(self.conn_id)
-                except Exception:
-                    pass  # 忽略错误，可能是 websockets 库不支持
+        # 直连模式下无需操作 WS 连接池（从未注册过此 conn_id）
+        if not self.direct:
+            for ws in self.ws_client.ws_pool:
+                if ws is not None:
+                    try:
+                        await ws.mark_connection_closed(self.conn_id)
+                    except Exception:
+                        pass  # 忽略错误，可能是 websockets 库不支持
 
         # 取消发送任务（如果有）
         if self._send_task and not self._send_task.done():
@@ -501,7 +597,7 @@ class HTTPConnectConnection:
             except asyncio.CancelledError:
                 pass
 
-        if notify_server:
+        if notify_server and not self.direct:
             try:
                 await self.ws_client.send_message(MSG_TYPE_CLOSE, self.conn_id, b'')
             except Exception as e:
@@ -731,10 +827,11 @@ class UDPRelayServer:
 
 class SOCKS5Server:
     """SOCKS5 服务器"""
-    def __init__(self, host: str, port: int, ws_client, udp_enabled: bool = False, udp_timeout: float = 60):
+    def __init__(self, host: str, port: int, ws_client, udp_enabled: bool = False, udp_timeout: float = 60, router=None):
         self.host = host
         self.port = port
         self.ws_client = ws_client
+        self.router = router
         self.connections: Dict[bytes, Union[SOCKS5Connection, HTTPConnectConnection]] = {}
         self.udp_enabled = udp_enabled
         self.udp_relay: Optional[UDPRelayServer] = None
@@ -813,7 +910,7 @@ class SOCKS5Server:
             elif protocol_byte == 0x43:  # 'C' - 可能是 "CONNECT"
                 # HTTP CONNECT 协议
                 logger.debug(f"[{conn_id.hex()}] Detected HTTP CONNECT protocol")
-                connection = HTTPConnectConnection(client_socket, conn_id, self.ws_client, first_byte)
+                connection = HTTPConnectConnection(client_socket, conn_id, self.ws_client, first_byte, router=self.router)
                 self.connections[conn_id] = connection
 
                 # 处理 HTTP CONNECT
@@ -875,6 +972,21 @@ class SOCKS5Server:
             else:  # CONNECT
                 # TCP CONNECT
                 logger.info(f"[{connection.conn_id.hex()}] Connecting to {target_addr}:{target_port}")
+
+                # 路由决策
+                if self.router is not None:
+                    action = self.router.decide(target_addr)
+                    if action == Action.BLOCK:
+                        logger.info(f"[{connection.conn_id.hex()}] Blocked: {target_addr}:{target_port}")
+                        await connection.socks5_connect_response(success=False)
+                        return
+                    if action == Action.DIRECT:
+                        logger.info(f"[{connection.conn_id.hex()}] Direct: {target_addr}:{target_port}")
+                        connection.direct = True
+                        await _handle_direct_connect(connection.conn_id, connection.client_socket,
+                                                     target_addr, target_port,
+                                                     connection.socks5_connect_response)
+                        return
 
                 # 发送连接请求到服务端
                 perf_t3 = time.time() if ENABLE_PERF_LOG else 0

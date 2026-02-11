@@ -1,5 +1,5 @@
 import setuptools
-version = '1.1.1'
+version = '1.1.4'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()
@@ -33,7 +33,10 @@ setuptools.setup(
         'websockets',
         'xxhash>=3.0.0',
         'msgpack',
-        'uvloop; sys_platform != "win32"',  # Linux/macOS 默认安装高性能事件循环
+        'winloop>=0.1.0; sys_platform == "win32"',
+        #'uvloop; sys_platform != "win32"',  # Linux/macOS 默认安装高性能事件循环
+        'uvloop; sys_platform != "win32" and python_version >= "3.7"',
+        'uvloop<0.15; sys_platform != "win32" and python_version < "3.7"',
         'pycryptodome>=3.18.0',
     ],
 

@@ -4,6 +4,7 @@ import argparse
 import time
 from wsocks.client.socks5_server import SOCKS5Server
 from wsocks.client.ws_client import WebSocketClient
+from wsocks.client.router import Router
 from wsocks.common.logger import setup_logger
 from wsocks.common.event_loop import setup_event_loop
 
@@ -63,6 +64,10 @@ async def async_main():
                 time.sleep(.5)
                 logger.warning('crypto_method is not set, but the url is ws://, this is not recommended !!!')
 
+        # 创建路由器（可选）
+        routing_config = config.get('routing')
+        router = Router(routing_config) if routing_config else None
+
         # 创建 SOCKS5 服务器
         udp_config = config.get('udp', {})
         socks5_server = SOCKS5Server(
@@ -70,7 +75,8 @@ async def async_main():
             config['local']['port'],
             ws_client,
             udp_enabled=udp_config.get('enabled', False),
-            udp_timeout=udp_config.get('timeout', 60)
+            udp_timeout=udp_config.get('timeout', 60),
+            router=router,
         )
         ws_client.socks5_server = socks5_server
 
