@@ -83,7 +83,7 @@ class WebSocketClient:
                     # 创建适配器
                     adapter = create_ws_adapter(
                         use_fingerprint=self.use_fingerprint,
-                        impersonate=self.impersonate
+                        impersonate=self.impersonate,
                     )
 
                     # 连接参数
@@ -93,7 +93,8 @@ class WebSocketClient:
                         connect_kwargs['ping_interval'] = None if self.heartbeat_enabled else self.ping_interval
                         connect_kwargs['ping_timeout'] = None if self.heartbeat_enabled else self.ping_timeout
                         connect_kwargs['compression'] = self.compression
-
+                    else:
+                        connect_kwargs['read_timeout'] = self.heartbeat_max * 1.5
                     # 连接
                     ws = await adapter.connect(self.url, **connect_kwargs)
 
@@ -129,12 +130,16 @@ class WebSocketClient:
                     logger.error(f"[WS-{index}] Connection error: {e}")
 
                     logger.debug(f"[WS-{index}] Connection error: {traceback.format_exc()}")
+                    # 清理该 WebSocket 的所有 SOCKS5 连接
+                    await self._cleanup_connections_for_ws(index)
                     self.ws_pool[index] = None
                     await asyncio.sleep(5)  # 重连延迟
 
         except asyncio.CancelledError:
             # 任务被取消（缩容时），清理并退出
             logger.info(f"[WS-{index}] Task cancelled (scale down)")
+            # 清理该 WebSocket 的所有 SOCKS5 连接
+            await self._cleanup_connections_for_ws(index)
             self.ws_pool[index] = None
             raise
 
@@ -150,6 +155,11 @@ class WebSocketClient:
                 logger.warning(f"[WS-{index}] Connection closed")
             else:
                 logger.error(f"[WS-{index}] Receive error: {traceback.format_exc()}")
+
+            # 关闭所有使用该 WebSocket 的 SOCKS5 连接
+            # 因为服务端的 WebSocket Handler 已经关闭，所有连接状态都丢失了
+            await self._cleanup_connections_for_ws(index)
+
             # 先关闭连接再清空
             if self.ws_pool[index]:
                 try:
@@ -291,7 +301,7 @@ class WebSocketClient:
                     logger.warning(f"[{conn_id.hex()}] UDP relay not available")
 
         except Exception as e:
-            logger.error(f"Handle message error: {e}")
+            logger.error(f"Handle message error:{traceback.format_exc()}")
 
     async def send_message(self, msg_type: int, conn_id: bytes, data: bytes):
         """发送消息（负载均衡到连接池）"""
@@ -324,11 +334,47 @@ class WebSocketClient:
                 except Exception as e:
                     logger.warning(f"[WS-{current_index}] Send failed: {e}, trying next...")
                     print(traceback.format_exc())
+                    # 清理该 WebSocket 的所有 SOCKS5 连接
+                    asyncio.ensure_future(self._cleanup_connections_for_ws(current_index))
                     self.ws_pool[current_index] = None
                     continue
 
         # 所有连接都不可用
         raise Exception("All WebSocket connections unavailable")
+
+    async def _cleanup_connections_for_ws(self, ws_index: int):
+        """清理所有使用指定 WebSocket 的 SOCKS5 连接
+
+        当 WebSocket 连接断开时，服务端会清理所有连接状态。
+        客户端需要同步清理，否则会出现 "Connection not found" 错误。
+
+        Args:
+            ws_index: 断开的 WebSocket 连接索引
+        """
+        if not self.socks5_server:
+            return
+
+        # 收集需要关闭的连接
+        connections_to_close = []
+        for conn_id, connection in list(self.socks5_server.connections.items()):
+            # 计算该连接应该使用的 WebSocket 索引
+            expected_ws_index = int.from_bytes(conn_id, 'big') % self.pool_size
+
+            # 如果该连接使用的是断开的 WebSocket，则需要关闭
+            if expected_ws_index == ws_index:
+                connections_to_close.append((conn_id, connection))
+
+        if connections_to_close:
+            logger.warning(f"[WS-{ws_index}] Cleaning up {len(connections_to_close)} SOCKS5 connections due to WebSocket disconnect")
+
+            # 关闭所有相关连接
+            for conn_id, connection in connections_to_close:
+                try:
+                    # 不通知服务端，因为服务端已经断开了
+                    await connection.close(notify_server=False)
+                except Exception as e:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[{conn_id.hex()}] Error closing connection: {e}")
 
     def _get_active_socks_count(self) -> int:
         """获取当前活跃的 SOCKS5 连接数"""

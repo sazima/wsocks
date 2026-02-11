@@ -32,7 +32,7 @@ class SOCKS5Connection:
         self.connect_error = None
         self.optimistic_send = optimistic_send  # 是否使用乐观发送（不等待 CONNECT_SUCCESS）
         self._connect_monitor_task = None  # 后台监听连接结果的任务
-        self._send_queue = asyncio.Queue(maxsize=512)  # 管道化发送队列（增大以支持高吞吐量上传）
+        self._send_queue = asyncio.Queue(maxsize=4096)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
 
 
@@ -291,7 +291,7 @@ class HTTPConnectConnection:
         self.connect_event = asyncio.Event()
         self.connect_success = False
         self.connect_error = None
-        self._send_queue = asyncio.Queue(maxsize=512)  # 管道化发送队列（增大以支持高吞吐量上传）
+        self._send_queue = asyncio.Queue(maxsize=4096)  # 管道化发送队列（增大以支持高吞吐量上传）
         self._send_task = None  # 管道化发送任务
 
     async def handle(self):

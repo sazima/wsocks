@@ -78,7 +78,7 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Received heartbeat ({len(data)} bytes)")
                 # 可以选择回应心跳或仅忽略
-                # asyncio.ensure_future(self.send_heartbeat_response(conn_id, data))
+                asyncio.ensure_future(self.send_heartbeat_response(conn_id, data))
             elif msg_type == MSG_TYPE_UDP_DATA:
                 # UDP 数据消息
                 asyncio.ensure_future(self.handle_udp_data(conn_id, data))
@@ -228,6 +228,22 @@ class WebSocketHandler(tornado.websocket.WebSocketHandler):
 
         # 锁释放后，清理锁本身
         self.conn_send_locks.pop(conn_id, None)
+
+    async def send_heartbeat_response(self, conn_id: bytes, data: bytes):
+        """发送心跳响应"""
+        try:
+            # 使用协商好的加密方法
+            crypto_manager = self.crypto_manager if self.client_crypto_method == 1 else None
+            # 原样返回数据 (Ping-Pong 模式) 或者发送空数据都可以
+            # 这里原样返回，方便客户端计算延迟
+            packed_data = Protocol.pack(MSG_TYPE_HEARTBEAT, conn_id, data, self.password, crypto_manager)
+            await self.write_message(packed_data, binary=True)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Sent heartbeat response ({len(data)} bytes)")
+        except Exception as e:
+            # 心跳发送失败通常意味着连接断开，记录即可，不需要过度处理
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Failed to send heartbeat response: {e}")
 
     async def handle_udp_data(self, conn_id: bytes, data: bytes):
         """处理 UDP 数据"""
