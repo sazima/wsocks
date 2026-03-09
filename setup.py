@@ -1,5 +1,5 @@
 import setuptools
-version = '1.1.4'
+version = '1.1.6'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()

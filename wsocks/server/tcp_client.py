@@ -104,13 +104,13 @@ class TargetConnection:
                     await self._send_queue.put(None)  # None 作为结束信号
                 except:
                     pass
-            await self.close()
+            await self.close(drain_queue=True)
 
     async def send_loop(self):
         """发送数据循环（管道化：从队列取出并发送）"""
         try:
-            while self.running:
-                # 从队列取出数据
+            while True:
+                # 从队列取出数据（不依赖 self.running，由 None 信号或 cancel 决定退出）
                 data = await self._send_queue.get()
 
                 # None 是结束信号
@@ -157,7 +157,7 @@ class TargetConnection:
             logger.error(f"[{self.conn_id.hex()}] Send error: {e}")
             await self.close()
 
-    async def close(self):
+    async def close(self, drain_queue: bool = False):
         """关闭连接"""
         # 防止并发关闭：只允许第一个 close() 调用执行完整的清理流程
         if self._closing:
@@ -176,8 +176,11 @@ class TargetConnection:
         logger.info(f"[{self.conn_id.hex()}] Closing target connection")
 
         try:
-            # 立即取消 read_loop 和 send_loop 任务
-            if self._read_task:
+            # 取消 read_loop 任务（若 close() 由 read_loop.finally 调用，则跳过自身）
+            # asyncio.current_task() 是 Python 3.7+，兼容 3.6 用 asyncio.Task.current_task()
+            _get_current_task = getattr(asyncio, 'current_task', None) or asyncio.Task.current_task
+            current_task = _get_current_task()
+            if self._read_task and self._read_task is not current_task:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"[{self.conn_id.hex()}] Read task status: done={self._read_task.done()}, cancelled={self._read_task.cancelled()}")
                 if not self._read_task.done():
@@ -193,22 +196,40 @@ class TargetConnection:
                     except Exception as e:
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(f"[{self.conn_id.hex()}] Read task error: {e}")
-            else:
+            elif not self._read_task:
                 logger.warning(f"[{self.conn_id.hex()}] No read task found!")
 
-            # 取消 send_loop 任务
-            if self._send_task:
-                if not self._send_task.done():
-                    logger.info(f"[{self.conn_id.hex()}] Cancelling send task")
+            # 处理 send_task
+            if self._send_task and not self._send_task.done():
+                if drain_queue:
+                    # CDN 主动关闭：排空队列，确保剩余数据全部发给客户端
+                    # read_loop.finally 已经 put(None)，此处 put_nowait 作补充保险
+                    if self._send_queue:
+                        try:
+                            self._send_queue.put_nowait(None)
+                        except asyncio.QueueFull:
+                            pass
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._send_task), timeout=30.0)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Send task drained and finished")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[{self.conn_id.hex()}] Send task drain timeout, force cancelling")
+                        self._send_task.cancel()
+                        try:
+                            await self._send_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    except (asyncio.CancelledError, Exception) as e:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[{self.conn_id.hex()}] Send task error: {e}")
+                else:
+                    # 客户端/Docker 主动关闭：立即取消，不再发送
                     self._send_task.cancel()
                     try:
                         await self._send_task
-                    except asyncio.CancelledError:
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"[{self.conn_id.hex()}] Send task cancelled")
-                    except Exception as e:
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"[{self.conn_id.hex()}] Send task error: {e}")
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             # 关闭写入端
             if self.writer:
