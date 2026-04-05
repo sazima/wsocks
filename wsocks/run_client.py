@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import argparse
 import time
 from wsocks.client.socks5_server import SOCKS5Server
@@ -22,7 +23,10 @@ async def async_main():
     logger.info(f"Loading config from: {args.config}")
     try:
         with open(args.config, 'r') as f:
-            config = json.load(f)
+            text = f.read()
+        # 去除 // 和 /* */ 注释，但不影响字符串内容
+        text = re.sub(r'("(?:[^"\\]|\\.)*")|//.*?$|/\*.*?\*/', lambda m: m.group(1) or '', text, flags=re.DOTALL | re.MULTILINE)
+        config = json.loads(text)
     except FileNotFoundError:
         logger.error(f"配置文件不存在: {args.config}")
         return
@@ -57,7 +61,8 @@ async def async_main():
             heartbeat_max=config['server'].get('heartbeat_max', 50),
             use_fingerprint=config['server'].get('use_fingerprint', False),
             impersonate=config['server'].get('impersonate', 'chrome124'),
-            crypto_method=crypto_method
+            crypto_method=crypto_method,
+            proxy=config['server'].get('proxy')
         )
         if not crypto_method and config['server']['url'].startswith('ws://'):
             for _ in range(3):

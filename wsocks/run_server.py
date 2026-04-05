@@ -1,4 +1,5 @@
 import json
+import re
 import argparse
 import tornado.ioloop
 import tornado.web
@@ -20,7 +21,9 @@ def main():
     logger.info(f"Loading config from: {args.config}")
     try:
         with open(args.config, 'r') as f:
-            config = json.load(f)
+            text = f.read()
+        text = re.sub(r'("(?:[^"\\]|\\.)*")|//.*?$|/\*.*?\*/', lambda m: m.group(1) or '', text, flags=re.DOTALL | re.MULTILINE)
+        config = json.loads(text)
     except FileNotFoundError:
         logger.error(f"配置文件不存在: {args.config}")
         return

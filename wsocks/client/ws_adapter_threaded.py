@@ -58,6 +58,7 @@ class ThreadedCurlWebSocket(WebSocketAdapter):
         self._running = True
         read_timeout: int = kwargs.get('read_timeout')
         self._read_timeout = read_timeout
+        self._proxy = kwargs.get('proxy')
 
         self._io_thread = threading.Thread(target=self._io_worker, daemon=True)
         self._io_thread.start()
@@ -100,6 +101,11 @@ class ThreadedCurlWebSocket(WebSocketAdapter):
             # 确保 ws_connect 不会永远卡死，防止线程泄露
             session.curl.setopt(CurlOpt.CONNECTTIMEOUT, 10) # 10秒连不上就报错
             session.curl.setopt(CurlOpt.TIMEOUT, 0) # 数据传输不设总超时
+
+            # 代理设置
+            if self._proxy:
+                session.curl.setopt(CurlOpt.PROXY, self._proxy)
+                logger.info(f"[ThreadedWS] Using proxy: {self._proxy}")
 
             # 启用 TCP Keep-Alive
             try:

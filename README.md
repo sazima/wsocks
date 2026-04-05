@@ -101,12 +101,19 @@ wsocks_server -c config_server.json
 }
 ```
 
+**WebSocket 代理说明**:
+- `proxy`: 客户端连接 WebSocket 服务端时使用的前置代理，适用于客户端本身需要通过代理访问外网的场景
+- 支持格式：`http://host:port`、`http://user:pass@host:port`、`socks5://host:port`、`socks5://user:pass@host:port`
+- 不配置则直连服务端
+
 **TLS 指纹伪装说明**:
 - `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.14.0`， `pip install curl_cffi==0.14.0`）
 - `impersonate`: 指定浏览器指纹，支持 Chrome、Safari、Firefox、Edge, [支持的浏览器指纹列表](#支持的浏览器指纹列表)
 - 开发阶段，可能不稳定，如不需要此功能，保持 `use_fingerprint: false` 即可，无需安装额外依赖
 
 正式使用务必自行配置使用wss
+
+> **提示**：配置文件支持 `//` 行注释和 `/* */` 块注释。
 
 ### 4. 启动客户端
 
@@ -150,6 +157,7 @@ wsocks_client -c config_client.json
 | server.heartbeat_max | 心跳最大间隔（秒） | 50    |
 | server.use_fingerprint | 启用 TLS 指纹伪装 | false |
 | server.impersonate | 浏览器指纹（chrome99-136/safari153-260/firefox133,135） | chrome124 |
+| server.proxy | WebSocket 连接使用的代理（见下方说明） | 无 |
 | local.port | 本地代理端口（支持 SOCKS5 / HTTP） | 1080  |
 | udp.enabled | 启用 UDP 转发（SOCKS5 UDP Associate） | false |
 | udp.timeout | UDP 会话超时时间（秒） | 60    |

@@ -17,7 +17,8 @@ class WebSocketClient:
     """WebSocket 客户端（支持连接池）"""
     def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8,
                  heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50,
-                 use_fingerprint: bool = False, impersonate: str = "chrome124", crypto_method: Optional[str] = None):
+                 use_fingerprint: bool = False, impersonate: str = "chrome124", crypto_method: Optional[str] = None,
+                 proxy: Optional[str] = None):
         self.url = url
         self.password = password
         self.socks5_server = socks5_server
@@ -36,6 +37,9 @@ class WebSocketClient:
         # TLS 指纹伪装配置
         self.use_fingerprint = use_fingerprint
         self.impersonate = impersonate
+
+        # WebSocket 代理
+        self.proxy = proxy
 
         # 应用层心跳配置
         self.heartbeat_enabled = heartbeat_enabled
@@ -95,6 +99,8 @@ class WebSocketClient:
                         connect_kwargs['compression'] = self.compression
                     else:
                         connect_kwargs['read_timeout'] = self.heartbeat_max * 1.5
+                    if self.proxy:
+                        connect_kwargs['proxy'] = self.proxy
                     # 连接
                     ws = await adapter.connect(self.url, **connect_kwargs)
 

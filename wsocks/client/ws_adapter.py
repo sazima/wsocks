@@ -86,12 +86,18 @@ class WebSocketsAdapter(WebSocketAdapter):
 
         logger.debug(f"[WebSocketsAdapter] Connecting to {url}")
 
-        self._ws = await websockets.connect(
-            url,
+        proxy = kwargs.get('proxy')
+
+        connect_kwargs = dict(
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
-            compression=compression
+            compression=compression,
         )
+        if proxy:
+            connect_kwargs['proxy'] = proxy
+            logger.info("[WebSocketsAdapter] Using proxy: %s", proxy)
+
+        self._ws = await websockets.connect(url, **connect_kwargs)
 
         logger.info(f"[WebSocketsAdapter] Connected to {url}")
         return self

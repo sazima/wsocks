@@ -1,5 +1,5 @@
 import setuptools
-version = '1.1.6'
+version = '1.1.8'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()
@@ -38,6 +38,7 @@ setuptools.setup(
         'uvloop; sys_platform != "win32" and python_version >= "3.7"',
         'uvloop<0.15; sys_platform != "win32" and python_version < "3.7"',
         'pycryptodome>=3.18.0',
+        'python-socks[asyncio]',
     ],
 
     # 可选依赖（用于特殊场景）
