@@ -62,7 +62,8 @@ async def async_main():
             use_fingerprint=config['server'].get('use_fingerprint', False),
             impersonate=config['server'].get('impersonate', 'chrome124'),
             crypto_method=crypto_method,
-            proxy=config['server'].get('proxy')
+            proxy=config['server'].get('proxy'),
+            impersonate_class_version=config['server'].get('impersonate_class_version', 2)
         )
         if not crypto_method and config['server']['url'].startswith('ws://'):
             for _ in range(3):

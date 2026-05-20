@@ -18,7 +18,7 @@ class WebSocketClient:
     def __init__(self, url: str, password: str, socks5_server, ping_interval: float = 30, ping_timeout: float = 10, compression: bool = True, pool_size: int = 8,
                  heartbeat_enabled: bool = True, heartbeat_min: float = 20, heartbeat_max: float = 50,
                  use_fingerprint: bool = False, impersonate: str = "chrome124", crypto_method: Optional[str] = None,
-                 proxy: Optional[str] = None):
+                 proxy: Optional[str] = None, impersonate_class_version: int = None):
         self.url = url
         self.password = password
         self.socks5_server = socks5_server
@@ -37,6 +37,7 @@ class WebSocketClient:
         # TLS 指纹伪装配置
         self.use_fingerprint = use_fingerprint
         self.impersonate = impersonate
+        self.impersonate_class_version: int = impersonate_class_version
 
         # WebSocket 代理
         self.proxy = proxy
@@ -88,6 +89,7 @@ class WebSocketClient:
                     adapter = create_ws_adapter(
                         use_fingerprint=self.use_fingerprint,
                         impersonate=self.impersonate,
+                        version=self.impersonate_class_version
                     )
 
                     # 连接参数

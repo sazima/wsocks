@@ -18,7 +18,7 @@ from wsocks.common.logger import setup_logger
 
 logger = setup_logger()
 
-REQUIRED_CURL_CFFI_VERSION = '0.14.0'
+REQUIRED_CURL_CFFI_VERSION = '0.15.0'
 
 
 class ConnectionClosed(Exception):
