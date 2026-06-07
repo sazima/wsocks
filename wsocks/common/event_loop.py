@@ -8,24 +8,39 @@ import asyncio
 import logging
 import sys
 
-logger = logging.getLogger(__name__)
+from wsocks.common.logger import setup_logger
+
+logger = setup_logger()
 
 
 def setup_event_loop():
-    """设置事件循环（如果可用则使用 uvloop）
+    """设置事件循环（Windows 使用 winloop，其他平台使用 uvloop）
 
     Returns:
-        bool: 如果成功启用 uvloop 返回 True，否则返回 False
+        bool: 如果成功启用高性能事件循环返回 True，否则返回 False
     """
-    # Windows 不支持 uvloop
     if sys.platform == 'win32':
-        logger.info("⚠️  Running on Windows, uvloop not available (using default asyncio)")
-        return False
+        try:
+            import winloop
+
+            winloop.install()
+
+            logger.info("✅ Using winloop (high performance event loop for Windows)")
+            return True
+
+        except ImportError:
+            logger.info("⚠️  winloop not installed, using default asyncio")
+            logger.info("   To enable winloop: pip install winloop")
+            return False
+
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to initialize winloop: {e}")
+            logger.warning("   Falling back to default asyncio")
+            return False
 
     try:
         import uvloop
 
-        # 尝试设置 uvloop 作为默认事件循环策略
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
         logger.info("✅ Using uvloop (high performance event loop, ~20-30% faster)")
@@ -54,6 +69,7 @@ def get_event_loop_info():
     info = {
         'loop_class': loop_class,
         'is_uvloop': 'uvloop' in loop_class.lower(),
+        'is_winloop': 'winloop' in loop_class.lower(),
         'platform': sys.platform,
     }
 

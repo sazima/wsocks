@@ -168,11 +168,47 @@ class ThreadedCurlWebSocketV2(WebSocketAdapter):
     #  Internal: recv loop                                                 #
     # ------------------------------------------------------------------ #
 
+    def _recv_with_timeout(self) -> tuple:
+        """带超时的 recv，替代 ws.recv() 的无限阻塞循环。
+
+        ws.recv() 在无数据时会死循环 select(0.5s) → AGAIN → select(0.5s)，
+        永不返回，导致看门狗失效。这里手动实现，每轮 select 后检查 _running
+        和 read_timeout，确保休眠唤醒后能及时检测到死连接。
+        """
+        from curl_cffi.const import CurlWsFlag, CurlECode, CurlInfo
+        # from curl_cffi._wrapper import CurlError
+        from select import select as _select
+        from curl_cffi import CurlError
+
+        chunks = []
+        flags = 0
+
+        sock_fd = self._ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+
+        while self._running:
+            try:
+                chunk, frame = self._ws.recv_fragment()
+                flags = frame.flags
+                chunks.append(chunk)
+                if frame.bytesleft == 0 and flags & CurlWsFlag.CONT == 0:
+                    break
+            except CurlError as e:
+                if e.code == CurlECode.AGAIN:
+                    # 每次 select 0.5s，然后回到 while 检查 _running
+                    _select([sock_fd], [], [], 0.5)
+                else:
+                    raise
+
+        if not self._running:
+            raise ConnectionError("WebSocket shutting down")
+
+        return b"".join(chunks), flags
+
     def _recv_loop(self):
         """持续从 WebSocket 接收数据，推入 recv_queue
 
-        ws.recv() 内部已处理分片和 AGAIN，每次调用返回一个完整消息：
-            (bytes, int)  —— 第二个值是 flags 的原始 int
+        使用 _recv_with_timeout 替代 ws.recv()，每 0.5s 检查一次
+        _running 和 read_timeout，确保休眠唤醒后能及时触发重连。
         """
         from curl_cffi.const import CurlWsFlag
 
@@ -180,12 +216,14 @@ class ThreadedCurlWebSocketV2(WebSocketAdapter):
 
         try:
             while self._running:
-                # read_timeout 看门狗：ws.recv() 内部 select 最多阻塞 0.5s，所以这里能及时检测
+                # read_timeout 看门狗：_recv_with_timeout 每 0.5s 让出一次控制权
                 if self._read_timeout and (time.time() - last_recv > self._read_timeout):
                     raise TimeoutError(f"[CurlWSv2] Read timeout ({self._read_timeout}s)")
 
                 try:
-                    data, flags = self._ws.recv()
+                    data, flags = self._recv_with_timeout()
+                except ConnectionError:
+                    break  # shutting down
                 except Exception as e:
                     if self._running:
                         logger.info(f"[CurlWSv2] recv error: {e}")
