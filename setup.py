@@ -1,5 +1,5 @@
 import setuptools
-version = '1.1.9'
+version = '1.1.10'
 
 with open("README.md", "r", encoding="utf8") as f:
     readme = f.read()
@@ -44,6 +44,9 @@ setuptools.setup(
     # 可选依赖（用于特殊场景）
     extras_require={
         'no-uvloop': [],  # 如果不想安装 uvloop: pip install wsocks[no-uvloop]
+        # TLS 指纹伪装 (--fingerprint / --impersonate)，需要 curl_cffi==0.15.0 且 Python>=3.10
+        # 安装: pip install wsocks[fingerprint]
+        'fingerprint': ['curl_cffi==0.15.0; python_version >= "3.10"'],
     },
 
     # 使用 wheel 格式而不是 egg

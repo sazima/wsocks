@@ -46,6 +46,12 @@ pip install wsocks
 pip install 'wsocks[no-uvloop]'
 ```
 
+如需 TLS 指纹伪装功能（`--fingerprint` / `--impersonate`），额外安装可选依赖（需要 Python 3.10+）：
+
+```bash
+pip install 'wsocks[fingerprint]'
+```
+
 ## 使用方法
 
 ### 1. 服务端配置
@@ -107,7 +113,7 @@ wsocks_server -c config_server.json
 - 不配置则直连服务端
 
 **TLS 指纹伪装说明**:
-- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.15.0`， `pip install curl_cffi==0.15.0`）
+- `use_fingerprint`: 设置为 `true` 启用 TLS 指纹伪装（需要 Python 3.10+ 和 `curl_cffi==0.15.0`，安装：`pip install 'wsocks[fingerprint]'`）
 - `impersonate`: 指定浏览器指纹，支持 Chrome、Safari、Firefox、Edge, [支持的浏览器指纹列表](#支持的浏览器指纹列表)
 - 开发阶段，可能不稳定，如不需要此功能，保持 `use_fingerprint: false` 即可，无需安装额外依赖
 
@@ -117,9 +123,53 @@ wsocks_server -c config_server.json
 
 ### 4. 启动客户端
 
+使用配置文件启动：
+
 ```bash
 wsocks_client -c config_client.json
 ```
+
+#### 无配置文件启动（命令行参数）
+
+也可以完全不用配置文件，直接用命令行参数启动，最少只需服务器地址与密码：
+
+```bash
+# 最简启动
+wsocks_client -s wss://your-server.com:8888/ws -k your-password
+
+# 指定本地监听、加密方式，并启用「私有网段直连、其余走代理」
+wsocks_client -s wss://your-server.com:8888/ws -k your-password \
+  -l 127.0.0.1:1080 -m chacha20 --direct-lan
+
+# 使用浏览器 TLS 指纹（指定 --impersonate 会自动启用指纹伪装）
+wsocks_client -s wss://your-server.com:8888/ws -k your-password --impersonate safari180
+```
+
+命令行参数也可与 `-c` 混用，用于临时覆盖配置文件中的字段（例如临时切换服务器、调高日志级别）：
+
+```bash
+wsocks_client -c config_client.json -s wss://backup.com/ws --log-level DEBUG
+```
+
+**参数说明**：
+
+| 参数 | 对应配置项 | 说明 |
+|------|-----------|------|
+| `-c, --config` | — | 配置文件路径（不指定且当前目录存在 `config_client.json` 时自动加载） |
+| `-s, --server` | `server.url` | WebSocket 服务器地址（`ws://` 或 `wss://`），无配置文件时必填 |
+| `-k, --password` | `server.password` | 连接密码，无配置文件时必填 |
+| `-l, --listen` | `local.host:port` | 本地监听地址 `HOST:PORT`（默认 `127.0.0.1:28888`） |
+| `-m, --crypto` | `server.crypto_method` | 加密方式（如 `chacha20`） |
+| `--pool-size` | `server.ws_pool_size` | WebSocket 连接池大小（默认 8） |
+| `--compression` / `--no-compression` | `server.compression` | 启用 / 禁用压缩 |
+| `--proxy` | `server.proxy` | 连接服务端使用的前置代理 |
+| `--fingerprint` | `server.use_fingerprint` | 启用 TLS 指纹伪装（需 Python 3.10+ 与 `curl_cffi`） |
+| `--impersonate` | `server.impersonate` | 浏览器指纹（指定后自动启用指纹伪装），如 `chrome124`、`safari180` |
+| `--udp` | `udp.enabled` | 启用 UDP 转发 |
+| `--direct-lan` | `routing` | 内置路由：私有网段直连、其余走代理 |
+| `--log-level` | `log_level` | 日志等级（如 `INFO`、`DEBUG`） |
+
+> 更细致的分流规则请使用配置文件的 `routing` 字段，详见[分流规则配置](#分流规则配置)。
 
 ### 5. 配置代理
 

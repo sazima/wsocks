@@ -4,3 +4,5 @@ xxhash>=3.0.0
 msgpack
 uvloop>=0.17.0; sys_platform != "win32"  # 高性能事件循环（Linux/macOS 默认安装）
 pycryptodome>=3.18.0
+# TLS 指纹伪装（--fingerprint / --impersonate）可选依赖，需 Python>=3.10
+curl_cffi==0.15.0; python_version >= "3.10"

@@ -159,7 +159,7 @@ def create_ws_adapter(
         # 检查 Python 版本
         if sys.version_info < (3, 10):
             raise RuntimeError(
-                f"TLS fingerprinting requires Python 3.7+, current: {sys.version_info.major}.{sys.version_info.minor}\n"
+                f"TLS fingerprinting requires Python 3.10+, current: {sys.version_info.major}.{sys.version_info.minor}\n"
                 "Please upgrade Python or disable fingerprinting (use_fingerprint=False)"
             )
 
